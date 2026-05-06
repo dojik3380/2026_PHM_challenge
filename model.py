@@ -20,8 +20,8 @@ class STFTCNNLSTMRULModel(nn.Module):
         self,
         vibration_channels: int = 4,
         operation_features: int = 6,
-        vib_hidden: int = 128,
-        op_hidden: int = 32,
+        vib_hidden: int = 256,
+        op_hidden: int = 64,
         dropout: float = DROPOUT,
     ):
         super().__init__()

@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -109,7 +110,8 @@ def train_model(
         vibration_channels=X_vib.shape[2],
         operation_features=X_op.shape[-1],
     ).to(device)
-    criterion = AsymmetricRULLoss()
+    # criterion = AsymmetricRULLoss()
+    criterion = nn.MSELoss() 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     print(f"Loaded {len(y)} sequences from {data_dir}")
