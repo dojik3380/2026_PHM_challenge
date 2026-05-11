@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import (
@@ -25,7 +25,7 @@ from config import (
     WINDOW_SIZE,
 )
 from data_loader import load_dataset, operation_feature_names
-from model import AsymmetricRULLoss, create_model
+from model import AsymmetricRULLoss, CombinedLoss, create_model
 
 
 def _standardize_temporal_array(
@@ -63,7 +63,7 @@ def train_model(
     random_state: int = RANDOM_STATE,
     max_samples: Optional[int] = None,
 ) -> Path:
-    """80/20 분할, DataLoader, Adam, 비대칭 RUL loss로 학습한다."""
+    """Case-level split, DataLoader, AdamW, 비대칭 RUL loss로 학습한다."""
     X_vib, X_op, y, metadata = load_dataset(
         root_dir=data_dir,
         window_size=window_size,
@@ -73,18 +73,19 @@ def train_model(
     if len(y) < 2:
         raise ValueError("At least two sequence samples are required for train/validation split.")
 
-    indices = np.arange(len(y))
-    train_idx, val_idx = train_test_split(
-        indices,
-        test_size=TEST_SIZE,
-        random_state=random_state,
-        shuffle=True,
-    )
+    # Case-level split: metadata['case_name']을 group으로 사용
+    groups = metadata['case_name'].values
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=random_state)
+    train_idx, val_idx = next(gss.split(X=np.arange(len(y)), y=None, groups=groups))
 
     X_vib_train, X_vib_val, vib_mean, vib_std = _standardize_temporal_array(X_vib[train_idx], X_vib[val_idx])
     X_op_train, X_op_val, op_mean, op_std = _standardize_temporal_array(X_op[train_idx], X_op[val_idx])
     y_train = y[train_idx].astype(np.float32)
     y_val = y[val_idx].astype(np.float32)
+
+    # RUL log scaling 적용
+    y_train = np.log1p(y_train)
+    y_val = np.log1p(y_val)
 
     train_loader = DataLoader(
         TensorDataset(
@@ -110,9 +111,9 @@ def train_model(
         vibration_channels=X_vib.shape[2],
         operation_features=X_op.shape[-1],
     ).to(device)
-    # criterion = AsymmetricRULLoss()
-    criterion = nn.MSELoss() 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = CombinedLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     print(f"Loaded {len(y)} sequences from {data_dir}")
     print(f"X_vibration: {X_vib.shape} | X_operation: {X_op.shape} | y: {y.shape}")
@@ -131,6 +132,7 @@ def train_model(
             predictions = model(batch_vib, batch_op)
             loss = criterion(predictions, batch_y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss += loss.item() * batch_y.size(0)
 
@@ -145,6 +147,7 @@ def train_model(
 
         train_loss /= len(train_loader.dataset)
         val_loss /= len(val_loader.dataset)
+        scheduler.step(val_loss)
         print(f"Epoch {epoch:03d}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
 
     model_path = Path(model_path)

@@ -141,6 +141,10 @@ def evaluate_model(
 
     model = _load_trained_model(checkpoint)
     y_pred = _predict(model, X_vib, X_op)
+    
+    # RUL log scaling 복원
+    y_pred = np.expm1(y_pred)
+    print(f"y_pred[:5] after expm1: {y_pred[:5]}")
 
     arul = asymmetric_rul_score_np(y_pred, y)
     metrics = {
@@ -187,6 +191,9 @@ def predict_validation(
 
     model = _load_trained_model(checkpoint)
     y_pred = _predict(model, X_vib, X_op)
+    
+    # RUL log scaling 복원
+    y_pred = np.expm1(y_pred)
 
     file_names = metadata["case_name"].astype(str).tolist()
     if not all(name.lower().startswith("validation") for name in file_names):
