@@ -11,7 +11,7 @@ import torch
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from config import DEVICE, MODEL_PATH, PREDICTION_PATH, STRIDE, TEST_DIR, VALIDATION_PREDICTION_PATH, WINDOW_SIZE
-from data_loader import load_dataset, load_inference_dataset
+from data_loader import discover_cases, load_dataset, load_inference_dataset
 from model import asymmetric_rul_score_np, create_model
 
 
@@ -29,6 +29,20 @@ def _load_trained_model(checkpoint: dict) -> torch.nn.Module:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
+
+
+def _has_operation_cases(root_dir: Path) -> bool:
+    """Return True when the directory contains labeled operation cases."""
+    return bool(discover_cases(root_dir))
+
+
+def _save_prediction_output(df: pd.DataFrame, output_path: Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix.lower() in (".xlsx", ".xls"):
+        _save_xlsx(df, output_path)
+    else:
+        df.to_csv(output_path, index=False)
 
 
 def _predict(
@@ -127,48 +141,66 @@ def evaluate_model(
     stride: int = STRIDE,
     max_samples: Optional[int] = None,
 ) -> dict:
-    """추론 후 MAE, RMSE, A_RUL을 계산한다."""
+    """추론 후 MAE, RMSE, A_RUL을 계산한다.
+
+    TDMS-only 테스트 세트가 주어지면 `predict_validation` 방식으로 파일별 RUL 스코어만 생성합니다.
+    """
     checkpoint = torch.load(model_path, map_location="cpu")
-    X_vib, X_op, y, metadata = load_dataset(
-        root_dir=data_dir,
+
+    if _has_operation_cases(data_dir):
+        X_vib, X_op, y, metadata = load_dataset(
+            root_dir=data_dir,
+            window_size=window_size,
+            stride=stride,
+            max_samples=max_samples,
+        )
+
+        X_vib = _apply_standardization(X_vib, checkpoint["vibration_mean"], checkpoint["vibration_std"])
+        X_op = _apply_standardization(X_op, checkpoint["operation_mean"], checkpoint["operation_std"])
+
+        model = _load_trained_model(checkpoint)
+        y_pred = _predict(model, X_vib, X_op)
+        y_pred = np.expm1(y_pred)
+        print(f"y_pred[:5] after expm1: {y_pred[:5]}")
+
+        arul = asymmetric_rul_score_np(y_pred, y)
+        metrics = {
+            "MAE": float(mean_absolute_error(y, y_pred)),
+            "RMSE": float(np.sqrt(mean_squared_error(y, y_pred))),
+            "A_RUL": float(np.mean(arul)),
+        }
+
+        print(f"MAE: {metrics['MAE']:.6f}")
+        print(f"RMSE: {metrics['RMSE']:.6f}")
+        print(f"A_RUL: {metrics['A_RUL']:.6f}")
+
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            results = metadata.copy()
+            results["true_RUL"] = y
+            results["predicted_RUL"] = y_pred
+            results["error"] = y_pred - y
+            results["A_RUL"] = arul
+            results.to_csv(output_path, index=False)
+            print(f"Saved predictions to {output_path}")
+
+        return metrics
+
+    print(f"No labeled operation cases found in {data_dir}. Running TDMS-only inference instead.")
+    validation_results = predict_validation(
+        data_dir=data_dir,
+        model_path=model_path,
+        output_path=output_path if output_path is not None else VALIDATION_PREDICTION_PATH,
         window_size=window_size,
-        stride=stride,
         max_samples=max_samples,
     )
 
-    X_vib = _apply_standardization(X_vib, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-    X_op = _apply_standardization(X_op, checkpoint["operation_mean"], checkpoint["operation_std"])
-
-    model = _load_trained_model(checkpoint)
-    y_pred = _predict(model, X_vib, X_op)
-    
-    # RUL log scaling 복원
-    y_pred = np.expm1(y_pred)
-    print(f"y_pred[:5] after expm1: {y_pred[:5]}")
-
-    arul = asymmetric_rul_score_np(y_pred, y)
-    metrics = {
-        "MAE": float(mean_absolute_error(y, y_pred)),
-        "RMSE": float(np.sqrt(mean_squared_error(y, y_pred))),
-        "A_RUL": float(np.mean(arul)),
+    return {
+        "mode": "tdms_only_inference",
+        "cases": len(validation_results),
+        "output_path": str(output_path if output_path is not None else VALIDATION_PREDICTION_PATH),
     }
-
-    print(f"MAE: {metrics['MAE']:.6f}")
-    print(f"RMSE: {metrics['RMSE']:.6f}")
-    print(f"A_RUL: {metrics['A_RUL']:.6f}")
-
-    if output_path is not None:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        results = metadata.copy()
-        results["true_RUL"] = y
-        results["predicted_RUL"] = y_pred
-        results["error"] = y_pred - y
-        results["A_RUL"] = arul
-        results.to_csv(output_path, index=False)
-        print(f"Saved predictions to {output_path}")
-
-    return metrics
 
 
 def predict_validation(
@@ -207,9 +239,7 @@ def predict_validation(
     )
 
     if output_path is not None:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        _save_xlsx(results, output_path)
+        _save_prediction_output(results, Path(output_path))
         print(f"Saved validation RUL score file to {output_path}")
 
     return results

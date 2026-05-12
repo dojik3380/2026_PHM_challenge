@@ -13,9 +13,9 @@ VALIDATION_DIR = DATA_DIR / "Validation"
 MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-MODEL_PATH = MODELS_DIR / "stft_cnn_lstm_rul.pt"
-PREDICTION_PATH = RESULTS_DIR / "evaluation_predictions.csv"
-TEAM_NAME = "team_name"
+MODEL_PATH = MODELS_DIR / "stft_cnn_lstm_rul.pt" # 모델 체크포인트명 설정
+PREDICTION_PATH = RESULTS_DIR / "evaluation_predictions.csv"   # 예측 결과 저장명 설정
+TEAM_NAME = "PHM"
 VALIDATION_PREDICTION_PATH = RESULTS_DIR / f"{TEAM_NAME}_validation.xlsx"
 
 VIBRATION_CHANNELS = ("CH1", "CH2", "CH3", "CH4")
@@ -41,6 +41,7 @@ STFT_NOVERLAP = STFT_NPERSEG // 2
 STFT_FREQ_BINS = STFT_NPERSEG // 2 + 1
 VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS + 5  # STFT + handcrafted (RMS, Kurtosis, Crest, Envelope, Band Energy)
 
+# 모델 학습 설정
 WINDOW_SIZE = 32
 STRIDE = 4
 EPOCHS = 100
@@ -50,11 +51,11 @@ TEST_SIZE = 0.2
 RANDOM_STATE = 42
 DROPOUT = 0.3
 
-# Loss configuration
-HUBER_WEIGHT = 0.7
-ASYMMETRIC_WEIGHT = 0.3
-OVER_EST_PENALTY_SCALE = 50.0
-UNDER_EST_PENALTY_SCALE = 20.0
+# Loss 설정
+HUBER_WEIGHT = 0.7 # Huber loss의 가중치
+ASYMMETRIC_WEIGHT = 0.3 # Asymmetric loss의 가중치
+OVER_EST_PENALTY_SCALE = 50.0 # 과대평가에 대한 패널티를 (변경금지)
+UNDER_EST_PENALTY_SCALE = 20.0 # 과소평가에 대한 패널티를 (변경금지)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
