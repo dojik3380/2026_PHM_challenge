@@ -228,7 +228,8 @@ def predict_validation(
     y_pred = np.expm1(y_pred)
 
     file_names = metadata["case_name"].astype(str).tolist()
-    if not all(name.lower().startswith("validation") for name in file_names):
+    # Use original case names if they start with 'test' or 'validation', otherwise use Validation{i+1}
+    if not all(name.lower().startswith(("test", "validation")) for name in file_names):
         file_names = [f"Validation{i + 1}" for i in range(len(file_names))]
 
     results = pd.DataFrame(

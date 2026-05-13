@@ -13,7 +13,7 @@ VALIDATION_DIR = DATA_DIR / "Validation"
 MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-MODEL_PATH = MODELS_DIR / "stft_cnn_lstm_rul.pt" # 모델 체크포인트명 설정
+MODEL_PATH = MODELS_DIR / "RUL_Baseline.pt" # 모델 체크포인트명 설정
 PREDICTION_PATH = RESULTS_DIR / "evaluation_predictions.csv"   # 예측 결과 저장명 설정
 TEAM_NAME = "PHM"
 VALIDATION_PREDICTION_PATH = RESULTS_DIR / f"{TEAM_NAME}_validation.xlsx"
