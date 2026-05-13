@@ -1,15 +1,18 @@
 """STFT 진동 특징과 운전 데이터 특징 생성."""
 
+from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
 from scipy.signal import hilbert, stft
-from scipy.stats import kurtosis
+from scipy.stats import kurtosis, skew
 
 from config import (
     OPERATION_FEATURES,
     SAMPLING_RATE,
+    STFT_CACHE_DIR,
+    STFT_CACHE_ENABLED,
     STFT_FREQ_BINS,
     STFT_NOVERLAP,
     STFT_NPERSEG,
@@ -103,12 +106,35 @@ def vibration_handcrafted_features(signal: np.ndarray) -> np.ndarray:
 
 
 def vibration_stft_timestep(
-    channel_data: Mapping[str, Iterable[float]],
+    tdms_file_path: str | Path,
 ) -> np.ndarray:
     """
-    TDMS 파일 1개를 하나의 STFT timestep으로 변환한다.
+    TDMS 파일 1개를 STFT timestep으로 변환 (캐시 지원).
     출력 shape: (4, freq_bins + handcrafted_features)
     """
+    import hashlib
+    import pickle
+    from pathlib import Path
+    
+    tdms_path = Path(tdms_file_path)
+    
+    # 캐시 키 생성 (파일 경로 + 수정시간 기반)
+    file_stat = tdms_path.stat()
+    cache_key = hashlib.md5(f"{tdms_path}:{file_stat.st_mtime}".encode()).hexdigest()
+    cache_file = STFT_CACHE_DIR / f"{cache_key}.pkl"
+    
+    # 캐시 히트 시 로드
+    if STFT_CACHE_ENABLED and cache_file.exists():
+        try:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            pass  # 캐시 로드 실패 시 재계산
+    
+    # 캐시 미스 시 계산
+    from data_loader import load_tdms_channels
+    channel_data = load_tdms_channels(tdms_path)
+    
     normalized = {name.upper(): values for name, values in channel_data.items()}
     stft_vectors = []
     handcrafted_vectors = []
@@ -121,7 +147,17 @@ def vibration_stft_timestep(
     # STFT: (4, freq_bins), Handcrafted: (4, 5) -> concat to (4, freq_bins + 5)
     stft_stack = np.stack(stft_vectors, axis=0)
     handcrafted_stack = np.stack(handcrafted_vectors, axis=0)
-    return np.concatenate([stft_stack, handcrafted_stack], axis=1).astype(np.float32)
+    result = np.concatenate([stft_stack, handcrafted_stack], axis=1).astype(np.float32)
+    
+    # 캐시 저장
+    if STFT_CACHE_ENABLED:
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(result, f)
+        except Exception:
+            pass  # 캐시 저장 실패 시 무시
+    
+    return result
 
 
 def operation_vector(operation_df: pd.DataFrame, current_time: float, previous_time: float | None) -> np.ndarray:
@@ -186,3 +222,66 @@ def operation_vector(operation_df: pd.DataFrame, current_time: float, previous_t
         ],
         dtype=np.float32,
     )
+
+
+def augment_stft_features(stft_matrix: np.ndarray, aug_prob: float = 0.3) -> np.ndarray:
+    """STFT 특징에 노이즈 억제 중심 증강 적용 (대회 특성 고려)"""
+    augmented = stft_matrix.copy()
+    
+    # 1. 가벼운 가우시안 노이즈 (대회 노이즈 시뮬레이션)
+    if np.random.random() < aug_prob * 0.5:  # 확률 낮춤
+        noise_std = 0.02  # 기존 0.05 → 0.02로 감소
+        noise = np.random.normal(0, noise_std, augmented.shape)
+        augmented += noise
+    
+    # 2. 밝기 조정만 (콘트라스트 제외 - 노이즈 증가 방지)
+    if np.random.random() < aug_prob * 0.7:
+        brightness = np.random.uniform(0.95, 1.05)  # 범위 좁힘
+        augmented *= brightness
+    
+    # 3. SpecAugment-style 마스킹 (노이즈 패턴 학습용)
+    if np.random.random() < aug_prob * 0.4:
+        freq_bins, time_steps = augmented.shape
+        
+        # 빈도 마스킹 (좁은 범위)
+        if freq_bins > 1:
+            max_freq_width = max(1, freq_bins // 8)
+            mask_freq_width = np.random.randint(1, min(freq_bins, max_freq_width) + 1)
+            mask_freq_start = np.random.randint(0, freq_bins - mask_freq_width + 1)
+            augmented[mask_freq_start:mask_freq_start + mask_freq_width, :] *= 0.1  # 완전 마스킹 X
+        
+        # 시간 마스킹 (좁은 범위)
+        if time_steps > 1:
+            max_time_width = max(1, time_steps // 8)
+            mask_time_width = np.random.randint(1, min(time_steps, max_time_width) + 1)
+            mask_time_start = np.random.randint(0, time_steps - mask_time_width + 1)
+            augmented[:, mask_time_start:mask_time_start + mask_time_width] *= 0.1
+    
+    return np.maximum(augmented, 0)  # 음수 방지
+
+
+def augment_sequence_level(X_vib: np.ndarray, X_op: np.ndarray, y: float, aug_prob: float = 0.3) -> list:
+    """시퀀스 레벨 증강 (시간축 조작)"""
+    augmented = [(X_vib, X_op, y)]  # 원본 유지
+    
+    # 1. 가벼운 시간 반전 (물리적 의미 유지)
+    if np.random.random() < aug_prob * 0.6:
+        vib_reversed = np.flip(X_vib, axis=1)
+        op_reversed = np.flip(X_op, axis=1)
+        augmented.append((vib_reversed, op_reversed, y))
+    
+    # 2. 가벼운 시간 이동 (shift) 증강
+    if np.random.random() < aug_prob * 0.4:
+        shift = np.random.randint(-4, 5)
+        if shift != 0:
+            vib_shifted = np.roll(X_vib, shift, axis=0)
+            op_shifted = np.roll(X_op, shift, axis=0)
+            if shift > 0:
+                vib_shifted[:shift] = X_vib[0:1]
+                op_shifted[:shift] = X_op[0:1]
+            else:
+                vib_shifted[shift:] = X_vib[-1:]
+                op_shifted[shift:] = X_op[-1:]
+            augmented.append((vib_shifted, op_shifted, y))
+    
+    return augmented

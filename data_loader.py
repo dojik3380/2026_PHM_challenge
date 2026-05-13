@@ -167,7 +167,7 @@ def _case_timesteps(
     for index, tdms_path in enumerate(tdms_files):
         current_time = _time_from_tdms_index(index, max_time, total_files)
         channel_data = load_tdms_channels(tdms_path)
-        vibration_steps.append(vibration_stft_timestep(channel_data))
+        vibration_steps.append(vibration_stft_timestep(tdms_path))
         operation_steps.append(operation_vector(operation_df, current_time, previous_time))
         times.append(current_time)
         previous_time = current_time
@@ -241,7 +241,7 @@ def build_inference_sequence(
     selected_files = tdms_files[-window_size:]
     vibration_steps = []
     for tdms_path in selected_files:
-        vibration_steps.append(vibration_stft_timestep(load_tdms_channels(tdms_path)))
+        vibration_steps.append(vibration_stft_timestep(tdms_path))
 
     X_vibration = np.asarray([vibration_steps], dtype=np.float32)
     X_operation = np.zeros((1, window_size, len(OPERATION_FEATURES)), dtype=np.float32)
@@ -256,6 +256,48 @@ def build_inference_sequence(
         ]
     )
     return X_vibration, X_operation, metadata
+
+
+def apply_data_augmentation(X_vib_batch: np.ndarray, X_op_batch: np.ndarray, y_batch: np.ndarray, 
+                          aug_prob: float = 0.3) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """통합 데이터 증강 적용 (훈련 시에만 사용)"""
+    from features import augment_stft_features, augment_sequence_level
+    
+    vib_augmented = []
+    op_augmented = []
+    y_augmented = []
+    
+    for vib_seq, op_seq, y in zip(X_vib_batch, X_op_batch, y_batch):
+        # 원본 추가
+        vib_augmented.append(vib_seq)
+        op_augmented.append(op_seq)
+        y_augmented.append(y)
+        
+        # STFT 특징 증강 (각 채널별로)
+        vib_stft_aug = vib_seq.copy()
+        for ch in range(vib_seq.shape[1]):  # 채널별
+            for t in range(vib_seq.shape[0]):  # 타임스텝별
+                stft_features = vib_seq[t, ch]  # (freq_bins,) 
+                vib_stft_aug[t, ch] = augment_stft_features(
+                    stft_features.reshape(-1, 1), aug_prob
+                ).flatten()
+        
+        vib_augmented.append(vib_stft_aug)
+        op_augmented.append(op_seq)  # operation은 그대로
+        y_augmented.append(y)
+        
+        # 시퀀스 레벨 증강
+        seq_augmented = augment_sequence_level(vib_seq, op_seq, y, aug_prob)
+        for vib_aug, op_aug, y_aug in seq_augmented[1:]:  # 원본 제외
+            vib_augmented.append(vib_aug)
+            op_augmented.append(op_aug)
+            y_augmented.append(y_aug)
+    
+    return (
+        np.array(vib_augmented, dtype=np.float32),
+        np.array(op_augmented, dtype=np.float32), 
+        np.array(y_augmented, dtype=np.float32)
+    )
 
 
 def load_inference_dataset(

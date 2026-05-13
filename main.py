@@ -21,6 +21,7 @@ from config import (
     VALIDATION_DIR,
     VALIDATION_PREDICTION_PATH,
     WINDOW_SIZE,
+    clear_stft_cache,
 )
 from evaluate import evaluate_model, predict_validation
 from train import train_model
@@ -68,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     validation_parser.add_argument("--team-name", type=str, default=TEAM_NAME)
     validation_parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     validation_parser.add_argument("--max-samples", type=int, default=None)
+    
+    cache_parser = subparsers.add_parser("clear-cache", help="Clear STFT cache directory")
     return parser.parse_args()
 
 
@@ -109,6 +112,8 @@ def main() -> None:
             window_size=args.window_size,
             max_samples=args.max_samples,
         )
+    elif args.command == "clear-cache":
+        clear_stft_cache()
 
 
 if __name__ == "__main__":

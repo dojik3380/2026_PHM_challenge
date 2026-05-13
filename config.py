@@ -44,12 +44,14 @@ VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS + 5  # STFT + handcrafted (RMS, 
 # 모델 학습 설정
 WINDOW_SIZE = 32
 STRIDE = 4
-EPOCHS = 100
+EPOCHS = 50
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 DROPOUT = 0.3
+WEIGHT_DECAY = 0.0  # L2 regularization strength (0.0: 끔)
+AUGMENTATION_PROB = 0.3  # Data augmentation probability (0.0: 증강 끔, 0.3: 기본, 0.5: 강한 증강)
 
 # Loss 설정
 HUBER_WEIGHT = 0.7 # Huber loss의 가중치
@@ -61,3 +63,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# STFT 캐시 설정
+STFT_CACHE_DIR = PROJECT_ROOT / "stft_cache"
+STFT_CACHE_ENABLED = True  # True: 캐시 사용, False: 매번 계산
+STFT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clear_stft_cache():
+    """STFT 캐시 디렉토리 비우기"""
+    import shutil
+    if STFT_CACHE_DIR.exists():
+        shutil.rmtree(STFT_CACHE_DIR)
+        STFT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Cleared STFT cache: {STFT_CACHE_DIR}")
+    else:
+        print("STFT cache directory does not exist")

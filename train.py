@@ -22,7 +22,9 @@ from config import (
     STRIDE,
     TEST_SIZE,
     TRAIN_DIR,
+    WEIGHT_DECAY,
     WINDOW_SIZE,
+    AUGMENTATION_PROB,
 )
 from data_loader import load_dataset, operation_feature_names
 from model import AsymmetricRULLoss, CombinedLoss, create_model
@@ -83,6 +85,12 @@ def train_model(
     y_train = y[train_idx].astype(np.float32)
     y_val = y[val_idx].astype(np.float32)
 
+    # 데이터 증강 적용 (훈련 데이터만)
+    from data_loader import apply_data_augmentation
+    X_vib_train, X_op_train, y_train = apply_data_augmentation(
+        X_vib_train, X_op_train, y_train, aug_prob=AUGMENTATION_PROB
+    )
+
     # RUL log scaling 적용
     y_train = np.log1p(y_train)
     y_val = np.log1p(y_val)
@@ -112,7 +120,7 @@ def train_model(
         operation_features=X_op.shape[-1],
     ).to(device)
     criterion = CombinedLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     print(f"Loaded {len(y)} sequences from {data_dir}")
