@@ -44,18 +44,18 @@ VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS + 5  # STFT + handcrafted (RMS, 
 # 모델 학습 설정
 WINDOW_SIZE = 32
 STRIDE = 4
-EPOCHS = 50
+EPOCHS = 100
 BATCH_SIZE = 8
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-3
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-DROPOUT = 0.3
-WEIGHT_DECAY = 0.0  # L2 regularization strength (0.0: 끔)
+DROPOUT = 0.2
+WEIGHT_DECAY = 1e-4  # L2 regularization strength (0.0: 끔)
 AUGMENTATION_PROB = 0.3  # Data augmentation probability (0.0: 증강 끔, 0.3: 기본, 0.5: 강한 증강)
 
 # Loss 설정
-HUBER_WEIGHT = 0.7 # Huber loss의 가중치
-ASYMMETRIC_WEIGHT = 0.3 # Asymmetric loss의 가중치
+HUBER_WEIGHT = 0.5 # Huber loss의 가중치
+ASYMMETRIC_WEIGHT = 0.5 # Asymmetric loss의 가중치
 OVER_EST_PENALTY_SCALE = 50.0 # 과대평가에 대한 패널티를 (변경금지)
 UNDER_EST_PENALTY_SCALE = 20.0 # 과소평가에 대한 패널티를 (변경금지)
 

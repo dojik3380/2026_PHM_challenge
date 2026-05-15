@@ -24,7 +24,7 @@ coverage.xml
 data/
 models/
 results/
+stft_cache/
 *.tdms
 *.xlsx
 *.csv
-*.pkl
