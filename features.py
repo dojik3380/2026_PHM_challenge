@@ -62,7 +62,7 @@ def stft_magnitude_vector(signal: Iterable[float]) -> np.ndarray:
         padded=False,
     )
     magnitude = np.abs(zxx)
-    freq_vector = np.log1p(magnitude).mean(axis=1)
+    freq_vector = np.log1p(magnitude).max(axis=1)
 
     if freq_vector.size < STFT_FREQ_BINS:
         freq_vector = np.pad(freq_vector, (0, STFT_FREQ_BINS - freq_vector.size))

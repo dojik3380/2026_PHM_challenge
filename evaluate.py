@@ -25,6 +25,7 @@ def _load_trained_model(checkpoint: dict) -> torch.nn.Module:
     model = create_model(
         vibration_channels=checkpoint["vibration_channels"],
         operation_features=checkpoint["operation_features"],
+        vibration_features=checkpoint.get("vibration_features", 518),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -145,21 +146,30 @@ def evaluate_model(
 
     TDMS-only 테스트 세트가 주어지면 `predict_validation` 방식으로 파일별 RUL 스코어만 생성합니다.
     """
-    checkpoint = torch.load(model_path, map_location="cpu")
-
     if _has_operation_cases(data_dir):
-        X_vib, X_op, y, metadata = load_dataset(
+        X_vib_raw, X_op_raw, y, metadata = load_dataset(
             root_dir=data_dir,
             window_size=window_size,
             stride=stride,
             max_samples=max_samples,
         )
 
-        X_vib = _apply_standardization(X_vib, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-        X_op = _apply_standardization(X_op, checkpoint["operation_mean"], checkpoint["operation_std"])
+        model_dir = Path(model_path).parent
+        base_name = Path(model_path).stem
+        fold_paths = sorted(list(model_dir.glob(f"{base_name}_fold*.pt")))
+        if not fold_paths:
+            fold_paths = [Path(model_path)]
 
-        model = _load_trained_model(checkpoint)
-        y_pred = _predict(model, X_vib, X_op)
+        all_preds = []
+        print(f"Loading {len(fold_paths)} model(s) for ensemble prediction...")
+        for f_path in fold_paths:
+            checkpoint = torch.load(f_path, map_location="cpu")
+            X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
+            X_op = _apply_standardization(X_op_raw, checkpoint["operation_mean"], checkpoint["operation_std"])
+            model = _load_trained_model(checkpoint)
+            all_preds.append(_predict(model, X_vib, X_op))
+            
+        y_pred = np.mean(all_preds, axis=0)
         y_pred = np.expm1(y_pred)
         print(f"y_pred[:5] after expm1: {y_pred[:5]}")
 
@@ -211,20 +221,28 @@ def predict_validation(
     max_samples: Optional[int] = None,
 ) -> pd.DataFrame:
     """Create a validation RUL score Excel file from TDMS-only cases."""
-    checkpoint = torch.load(model_path, map_location="cpu")
-    X_vib, X_op, metadata = load_inference_dataset(
+    X_vib_raw, X_op_raw, metadata = load_inference_dataset(
         root_dir=data_dir,
         window_size=window_size,
         max_samples=max_samples,
     )
 
-    X_vib = _apply_standardization(X_vib, checkpoint["vibration_mean"], checkpoint["vibration_std"])
-    X_op = _apply_standardization(X_op, checkpoint["operation_mean"], checkpoint["operation_std"])
+    model_dir = Path(model_path).parent
+    base_name = Path(model_path).stem
+    fold_paths = sorted(list(model_dir.glob(f"{base_name}_fold*.pt")))
+    if not fold_paths:
+        fold_paths = [Path(model_path)]
 
-    model = _load_trained_model(checkpoint)
-    y_pred = _predict(model, X_vib, X_op)
-    
-    # RUL log scaling 복원
+    all_preds = []
+    print(f"Loading {len(fold_paths)} model(s) for ensemble prediction...")
+    for f_path in fold_paths:
+        checkpoint = torch.load(f_path, map_location="cpu")
+        X_vib = _apply_standardization(X_vib_raw, checkpoint["vibration_mean"], checkpoint["vibration_std"])
+        X_op = _apply_standardization(X_op_raw, checkpoint["operation_mean"], checkpoint["operation_std"])
+        model = _load_trained_model(checkpoint)
+        all_preds.append(_predict(model, X_vib, X_op))
+        
+    y_pred = np.mean(all_preds, axis=0)
     y_pred = np.expm1(y_pred)
 
     file_names = metadata["case_name"].astype(str).tolist()

@@ -24,7 +24,11 @@ coverage.xml
 data/
 models/
 results/
+<<<<<<< HEAD
 stft_cache/
+=======
+outputs/
+>>>>>>> test
 *.tdms
 *.xlsx
 *.csv

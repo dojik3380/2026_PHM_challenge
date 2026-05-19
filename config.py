@@ -36,7 +36,7 @@ OPERATION_FEATURES = (
 
 # STFT 설정: 25.6 kHz 진동 신호를 주파수 영역으로 변환한다.
 SAMPLING_RATE = 25_600
-STFT_NPERSEG = 256
+STFT_NPERSEG = 1024
 STFT_NOVERLAP = STFT_NPERSEG // 2
 STFT_FREQ_BINS = STFT_NPERSEG // 2 + 1
 VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS + 5  # STFT + handcrafted (RMS, Kurtosis, Crest, Envelope, Band Energy)
@@ -44,7 +44,11 @@ VIBRATION_FEATURES_PER_CHANNEL = STFT_FREQ_BINS + 5  # STFT + handcrafted (RMS, 
 # 모델 학습 설정
 WINDOW_SIZE = 32
 STRIDE = 4
+<<<<<<< HEAD
 EPOCHS = 100
+=======
+EPOCHS = 60
+>>>>>>> test
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-3
 TEST_SIZE = 0.2
@@ -54,10 +58,17 @@ WEIGHT_DECAY = 1e-4  # L2 regularization strength (0.0: 끔)
 AUGMENTATION_PROB = 0.3  # Data augmentation probability (0.0: 증강 끔, 0.3: 기본, 0.5: 강한 증강)
 
 # Loss 설정
+<<<<<<< HEAD
 HUBER_WEIGHT = 0.5 # Huber loss의 가중치
 ASYMMETRIC_WEIGHT = 0.5 # Asymmetric loss의 가중치
 OVER_EST_PENALTY_SCALE = 50.0 # 과대평가에 대한 패널티를 (변경금지)
 UNDER_EST_PENALTY_SCALE = 20.0 # 과소평가에 대한 패널티를 (변경금지)
+=======
+HUBER_WEIGHT = 0.7 # Huber loss의 가중치
+ASYMMETRIC_WEIGHT = 0.3 # Asymmetric loss의 가중치
+OVER_EST_PENALTY_SCALE = 20.0 # 과대평가에 대한 패널티 (엄격함)
+UNDER_EST_PENALTY_SCALE = 50.0 # 과소평가에 대한 패널티 (관대함)
+>>>>>>> test
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
