@@ -24,6 +24,7 @@ coverage.xml
 data/
 models/
 results/
+outputs/
 *.tdms
 *.xlsx
 *.csv

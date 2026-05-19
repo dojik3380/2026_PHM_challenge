@@ -16,6 +16,28 @@ from config import (
     VIBRATION_FEATURES_PER_CHANNEL,
 )
 
+class SEBlock1D(nn.Module):
+    """
+    Squeeze-and-Excitation Block for 1D CNN.
+    특정 주파수 채널(Fault Harmonic)에 어텐션을 주어 노이즈를 억제합니다.
+    """
+    def __init__(self, channel, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, max(1, channel // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(1, channel // reduction), channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
 
 class STFTCNNLSTMRULModel(nn.Module):
     """
@@ -28,6 +50,7 @@ class STFTCNNLSTMRULModel(nn.Module):
         self,
         vibration_channels: int = 4,
         operation_features: int = len(OPERATION_FEATURES),
+        vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL,
         vib_hidden: int = 128,
         op_hidden: int = 32,
         dropout: float = DROPOUT,
@@ -38,15 +61,29 @@ class STFTCNNLSTMRULModel(nn.Module):
             nn.Conv1d(vibration_channels, 32, kernel_size=5, padding=2),
             nn.BatchNorm1d(32),
             nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2),
+            SEBlock1D(32),
             nn.Conv1d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2, stride=2),
-            nn.AdaptiveAvgPool1d(1),
+            SEBlock1D(64),
             nn.Flatten(),
         )
+        
+        # Calculate flattened size dynamically
+        dummy_input = torch.zeros(1, vibration_channels, vibration_features)
+        with torch.no_grad():
+            cnn_out_size = self.vibration_cnn(dummy_input).shape[1]
+            
+        self.vibration_projection = nn.Sequential(
+            nn.Linear(cnn_out_size, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        
         self.vibration_lstm = nn.LSTM(
-            input_size=64,
+            input_size=128,
             hidden_size=vib_hidden,
             num_layers=2,
             batch_first=True,
@@ -61,8 +98,12 @@ class STFTCNNLSTMRULModel(nn.Module):
             bidirectional=True,
         )
 
-        # Attention fusion
-        self.attention = nn.Linear(vib_hidden * 2 + op_hidden * 2, vib_hidden * 2 + op_hidden * 2)
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(vib_hidden * 2, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1)
+        )
+        self.last_attn_weights = None
 
         self.fusion = nn.Sequential(
             nn.Linear(vib_hidden * 2 + op_hidden * 2, 128),
@@ -74,24 +115,38 @@ class STFTCNNLSTMRULModel(nn.Module):
         )
 
     def forward(self, x_vibration: torch.Tensor, x_operation: torch.Tensor) -> torch.Tensor:
+        # Modality Dropout: 추론(Test) 시 운전 데이터가 0으로 들어오는 환경에 대비하기 위해
+        # 훈련(Train) 시 50% 확률로 운전 데이터를 모두 0으로 지워버려 진동 데이터에 대한 의존도를 높임
+        if self.training and torch.rand(1).item() < 0.5:
+            x_operation = torch.zeros_like(x_operation)
+            
         # x_vibration: (batch, seq_len, 4, freq_bins)
         batch_size, seq_len, channels, freq_bins = x_vibration.shape
 
         # CNN은 timestep별 STFT 스펙트럼에서 주파수 패턴을 추출한다.
         vib = x_vibration.reshape(batch_size * seq_len, channels, freq_bins)
         vib = self.vibration_cnn(vib)
+        vib = self.vibration_projection(vib)
 
         # 다시 시퀀스로 복원한 뒤 LSTM으로 degradation 흐름을 학습한다.
-        vib = vib.reshape(batch_size, seq_len, 64)
-        _, (h_vib, _) = self.vibration_lstm(vib)
-        h_vib_last = torch.cat([h_vib[-2], h_vib[-1]], dim=1)  # bidirectional concat
+        vib = vib.reshape(batch_size, seq_len, 128)
+        vib_out, _ = self.vibration_lstm(vib)
+        
+        # Temporal Attention Pooling
+        attn_scores = self.temporal_attention(vib_out)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        
+        # GPU memory leak 방지를 위해 detach.cpu()로 저장하여 시각화 모듈에서 꺼내 쓸 수 있도록 함
+        self.last_attn_weights = attn_weights.detach().cpu()
+        
+        h_vib_attended = torch.sum(vib_out * attn_weights, dim=1)
 
         # 운전 데이터도 별도 BiLSTM으로 시간 흐름을 학습한다.
         _, (h_op, _) = self.operation_lstm(x_operation)
-        h_op_last = torch.cat([h_op[-2], h_op[-1]], dim=1)  # bidirectional concat  # BiLSTM이므로 마지막 layer의 forward와 backward concat
+        h_op_last = torch.cat([h_op[-2], h_op[-1]], dim=1)  # bidirectional concat
 
         # Attention fusion
-        fused_input = torch.cat([h_vib_last, h_op_last], dim=1)  # (batch, 320)
+        fused_input = torch.cat([h_vib_attended, h_op_last], dim=1)
 
         return self.fusion(fused_input)
 
@@ -153,10 +208,11 @@ def asymmetric_rul_score_np(predictions, targets) -> np.ndarray:
     return np.exp(exponent)
 
 
-def create_model(vibration_channels: int = 4, operation_features: int = len(OPERATION_FEATURES)) -> STFTCNNLSTMRULModel:
+def create_model(vibration_channels: int = 4, operation_features: int = len(OPERATION_FEATURES), vibration_features: int = VIBRATION_FEATURES_PER_CHANNEL) -> STFTCNNLSTMRULModel:
     return STFTCNNLSTMRULModel(
         vibration_channels=vibration_channels,
         operation_features=operation_features,
+        vibration_features=vibration_features,
         vib_hidden=128,
         op_hidden=32,
     )
