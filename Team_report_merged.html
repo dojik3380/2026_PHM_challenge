@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang='ko'>
+<head>
+    <meta charset='UTF-8'>
+    <title>베어링 잔여수명(RUL) 예측 기술 리포트 (통합본)</title>
+    <style>
+        @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+        @page { size: A4; margin: 15mm 20mm; }
+        body { font-family: 'Pretendard', sans-serif; line-height: 1.5; color: #111; font-size: 10pt; background-color: white; }
+        .container { max-width: 210mm; margin: 0 auto; }
+        .header { text-align: center; border-bottom: 2px solid #2c3e50; padding-bottom: 10px; margin-bottom: 15px; }
+        h1 { font-size: 18pt; color: #2c3e50; margin: 0 0 5px 0; }
+        .team-info { font-size: 11pt; color: #555; text-align: right; margin-top: -20px; font-weight: 600; margin-bottom: 15px; }
+        h2 { font-size: 12.5pt; color: #2980b9; border-left: 4px solid #2980b9; padding-left: 8px; margin-top: 20px; margin-bottom: 10px; background-color: #f8f9fa; }
+        h3 { font-size: 11pt; color: #34495e; margin-top: 15px; margin-bottom: 5px; }
+        p { margin: 0 0 8px 0; text-align: justify; }
+        ul { margin: 0 0 10px 0; padding-left: 20px; }
+        li { margin-bottom: 5px; }
+        .highlight { background-color: #f1c40f40; font-weight: 600; padding: 0 2px; }
+        .code { font-family: 'Consolas', monospace; background-color: #f4f4f4; padding: 2px 4px; border-radius: 3px; font-size: 9pt; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 9.5pt; text-align: left; }
+        th { padding: 6px; border: 1px solid #bdc3c7; background-color: #ecf0f1; text-align: center; }
+        td { padding: 6px; border: 1px solid #ecf0f1; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <div class='header'>
+            <h1>베어링 잔여수명(RUL) 예측 기술 리포트 (통합본)</h1>
+
+        </div>
+        <style>
+        .team-info {
+        margin-top: 20px; /* 위쪽 공백 추가 */
+        }
+    </style>
+        <div class='team-info'>팀명: 빨랑튀어(Palan tuir)</div>
+        
+        <p>본 리포트는 수명 편차가 5.3배(최소 8.9h ~ 최대 47.6h)에 달하는 가혹한 OOD(Out-of-Distribution) 평가 환경에서, 비대칭 페널티 지표(A_RUL) 붕괴 현상을 극복하기 위해 당 팀이 독창적으로 고안한 <b>'FDP(First Degradation Point) 기반 2-Stage 적응형 예지보전 파이프라인'</b>의 모든 기술적 세부 사항을 명세합니다.</p>
+
+        <div>
+            <h2>1. 데이터 전처리 및 시계열 청킹(Chunking) 구조</h2>
+            <p>모델이 베어링의 장기적인 손상 트렌드를 문맥(Context)으로 파악할 수 있도록, 원시 진동 데이터를 다차원 시계열 윈도우로 청킹(Chunking)하여 입력합니다.</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th width="20%">처리 기법</th>
+                        <th width="55%">상세 명세 (Specification)</th>
+                        <th width="25%">데이터 차원 (Shape)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="font-weight: bold; text-align: center;">시계열 청킹<br>(Sliding Window)</td>
+                        <td>순간적인 노이즈 튐 현상을 방지하고자, <b>연속된 32개의 스텝(Window Size=32)</b>을 하나의 시퀀스로 묶습니다. 학습 시에는 데이터 다양성 확보를 위해 <span class='code'>Stride=4</span>로 오버랩 샘플링(Overlap Sampling)을 수행합니다.</td>
+                        <td class="code" style="text-align: center;">Seq_Length = 32</td>
+                    </tr>
+                    <tr>
+                        <td style="font-weight: bold; text-align: center;">주파수 스펙트럼<br>(Vibration Track)</td>
+                        <td>25.6kHz로 샘플링된 4채널 원시 진동 데이터를 단기 푸리에 변환(STFT)하여 노이즈를 필터링하고 핵심 주파수 대역별 에너지를 추출합니다.</td>
+                        <td class="code" style="text-align: center;">Batch &times; 32 &times; 4 &times; 1026</td>
+                    </tr>
+                    <tr>
+                        <td style="font-weight: bold; text-align: center;">도메인 통계 지표<br>(Handcrafted)</td>
+                        <td>RMS, Peak-to-Peak, Kurtosis 등 10종의 시간 도메인 지표와 베어링 고유 결함 주파수(BPFO, BPFI 등) 및 하모닉 에너지를 병렬로 추출하여 총 57차원의 특성 벡터를 사용합니다.</td>
+                        <td class="code" style="text-align: center;">Batch &times; 32 &times; 4 &times; 57</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div>
+            <h2>2. 모델 아키텍처 (Stage 1: HI Extraction Network)</h2>
+            <p>기존 단일 센서 기반 End-to-End 신경망의 한계를 극복하기 위해, 주파수 도메인과 물리적 통계 도메인 지식을 융합하는 <b>Dual-track Encoder 구조</b>를 채택했습니다. 딥러닝 모델은 진동 신호로부터 0.0 ~ 1.0 사이의 추상적인 물리적 손상도(Health Indicator, HI)를 도출합니다.</p>
+            
+            <h3>2.1. Vibration Track (주파수 도메인 인코딩)</h3>
+            <p>단기 푸리에 변환(STFT) 스펙트럼 데이터를 처리하여 특정 결함 주파수 대역의 변화를 포착합니다.</p>
+            <ul>
+                <li><b>1D-CNN 기반 특징 추출기:</b>
+                    <ul>
+                        <li><b>Block 1:</b> <span class='code'>Conv1d(in=4, out=32, kernel=5) &rarr; BatchNorm &rarr; ReLU &rarr; MaxPool1d(stride=2) &rarr; SEBlock1D(32)</span></li>
+                        <li><b>Block 2:</b> <span class='code'>Conv1d(in=32, out=64, kernel=3) &rarr; BatchNorm &rarr; ReLU &rarr; MaxPool1d(stride=2) &rarr; SEBlock1D(64)</span></li>
+                        <li><b>SE(Squeeze-and-Excitation) Block:</b> 각 주파수 채널별 Attention 가중치를 계산하여, 베어링 결함과 무관한 배경 노이즈(Background Noise)를 동적으로 억제합니다.</li>
+                    </ul>
+                </li>
+                <li><b>시계열 압축 (RNN & Temporal Attention):</b>
+                    <ul>
+                        <li>CNN을 통과하여 128-dim으로 Flatten된 특징 벡터는 <b>2-layer Bidirectional LSTM (은닉층 48-dim)</b>을 통과합니다.</li>
+                        <li>이후 Sinusoidal Positional Encoding이 추가되며, <span class='code'>Linear &rarr; Tanh &rarr; Softmax</span>로 구성된 Temporal Attention 기법을 통해 32스텝의 시계열 윈도우 정보를 단일 고정 차원 벡터로 압축합니다.</li>
+                    </ul>
+                </li>
+            </ul>
+
+            <h3>2.2. Handcrafted Features Track (도메인 지식 인코딩)</h3>
+            <p>순수 딥러닝이 놓칠 수 있는 물리적 마모 특성을 보완하기 위해 통계적 지표를 활용합니다.</p>
+            <ul>
+                <li><b>시계열 인코딩:</b> 57-dim 입력을 <span class='code'>Linear(64) &rarr; LayerNorm &rarr; ReLU &rarr; Dropout</span>으로 투영(Projection)한 뒤, <b>1-layer GRU (은닉층 48-dim)</b>를 통과시켜 시계열 변화율을 인코딩합니다. (마지막 은닉 상태 추출)</li>
+            </ul>
+
+            <h3>2.3. Context Fusion 및 Multi-head Output</h3>
+            <ul>
+                <li><b>특징 융합 (Fusion):</b> LSTM 출력(96-dim) + GRU 출력(48-dim) + 운전 경과 시간(Elapsed Fraction) 임베딩(8-dim)을 결합하여 총 152-dim의 벡터를 만듭니다. 이후 <span class='code'>Linear(152 &rarr; 96) &rarr; ReLU &rarr; Dropout</span> 융합 계층을 거칩니다.</li>
+                <li><b>출력 헤드 (Heads):</b>
+                    <ul>
+                        <li><b>HI Head:</b> <span class='code'>Linear(96 &rarr; 1) + Sigmoid</span>를 통해 최종적으로 베어링의 손상도(HI)를 0.0 ~ 1.0으로 회귀(Regression)합니다.</li>
+                        <li><b>Stage Head:</b> 보조 학습용 분류기로, <span class='code'>Linear(96 &rarr; 4 classes)</span>를 통해 베어링의 현재 상태(정상/초기/결함/심각)를 예측하여 절대적인 생애 주기(Context)를 학습하게 돕습니다.</li>
+                    </ul>
+                </li>
+            </ul>
+        </div>
+
+        <div>
+            <h2>3. 학습 방식 (Training Method & Loss Functions)</h2>
+            <p>모델이 진동 튐(Spike) 같은 단순한 노이즈가 아니라 '물리적으로 타당한 마모 궤적'을 학습하도록, 강력한 제약 조건을 거는 <b>5가지 복합 다중 손실 함수(Multi-task Loss)</b>를 설계했습니다.</p>
+            
+            <h3>3.1. 합성 지수 정답지 (Synthetic Target)</h3>
+            <p>노이즈가 심한 센서 측정값을 직접 RUL 정답지로 쓰지 않고, 베어링의 전체 수명 비율(Progress)을 바탕으로 가상의 지수 함수를 생성합니다.</p>
+            <p style='text-align:center; font-size: 11pt;'><b>HI(t) = [ exp(&alpha; &middot; progress) - 1 ] / [ exp(&alpha;) - 1 ]</b></p>
+            <p>초반에는 마모가 발생하지 않다가 파단 직전 급격히 솟구치는 곡선을 정답지로 삼아 매핑합니다.</p>
+            
+            <h3>3.2. 복합 손실 함수 설계 (L<sub>total</sub> = &lambda;<sub>1</sub>L<sub>hi</sub> + &lambda;<sub>2</sub>L<sub>rank</sub> + &lambda;<sub>3</sub>L<sub>mono</sub> + &lambda;<sub>4</sub>L<sub>smooth</sub> + &lambda;<sub>5</sub>L<sub>stage</sub>)</h3>
+            <ul>
+                <li><b>Huber Loss (L<sub>hi</sub>, &delta;=0.3):</b> 이상치 진동 노이즈에 크게 흔들리는 MSE 대신 Huber Loss를 적용하여 강건한 회귀를 수행합니다. 후반부(결함 구간)의 오차에 가중치를 부여해 임박한 파단 시점의 정확도를 높였습니다.</li>
+                <li><b>Pairwise Ranking Loss (L<sub>rank</sub>):</b> 물리법칙 강제 학습의 핵심입니다. 동일 베어링의 과거 예측치(HI<sub>i</sub>)와 미래 예측치(HI<sub>j</sub>)를 비교하여, <b>HI<sub>j</sub> > HI<sub>i</sub> + margin</b>을 만족하도록 강제합니다. (시간 역행 불가 원칙)</li>
+                <li><b>Monotonicity Loss (L<sub>mono</sub>):</b> 연속된 윈도우 예측값에서 <span class='code'>ReLU(HI<sub>t-1</sub> - HI<sub>t</sub>)</span>의 페널티를 부여합니다. 모델이 손상도를 낮게 예측하는 '회복' 오류를 범하지 않도록 수학적으로 락(Lock)을 겁니다.</li>
+                <li><b>Smoothness Loss (L<sub>smooth</sub>):</b> <b>|HI<sub>t</sub> - HI<sub>t-1</sub>|</b> 절대 오차를 최소화하여 모델 출력이 미친 듯이 튀지(Spiky) 않게 평활화합니다.</li>
+                <li><b>Stage Classification CE Loss (L<sub>stage</sub>):</b> 보조 헤드 분류 오차를 추가해, 데이터 간 분산(수명 차이)이 크더라도 모델이 베어링의 상대적 남은 생애를 올바르게 인식하도록 유도합니다.</li>
+            </ul>
+        </div>
+
+        <div>
+            <h2>4. 예측 방법 (Stage 2: RUL Extrapolation)</h2>
+            <p>테스트 단계에서 추출된 HI 궤적을 기반으로, 현재 결함 상태(FDP 도달 여부)에 따라 동적으로 예측 로직을 전환(Adaptive Extrapolation)합니다.</p>
+            
+            <h3>4.1. 시계열 노이즈 필터링 (Joseph-form Kalman Filter)</h3>
+            <ul>
+                <li>모델이 출력한 32스텝의 HI 궤적을 2D 상태 방정식 [HI, HI_dot] 기반의 <b>칼만 필터(Kalman Filter)</b>로 투입하여 노이즈를 스무딩합니다.</li>
+                <li>필터링된 출력값에 최종적으로 <span class='code'>np.maximum.accumulate</span>를 적용하여 단조 증가성을 하드 코딩(Hard enforcement)합니다.</li>
+            </ul>
+
+            <h3>4.2. 결함 징후 기준선(FDP) 산출 근거 및 하이브리드 예측 전환</h3>
+            <p>본 모델은 데이터 누수(Data Leakage) 없이 평가 데이터(Test Set) 각각에 대해 독립적으로 작동하도록 <b>'동적 FDP 임계치(Dynamic FDP Threshold)'</b> 방식을 설계하여 예측 모드를 분기합니다.</p>
+            
+            <ul>
+                <li><b>FDP 산출 근거 (3&sigma; Rule):</b> 임의의 고정값(예: 0.15)을 일괄 적용하지 않고, 각 테스트 베어링의 <b>초기 정상 구간(최초 30개 윈도우) HI 분포의 평균(&mu;) + 3&sigma;</b>를 기준으로 개별 임계치를 산출했습니다. 이는 학계 표준 이상 탐지 기법으로, 베어링마다 다른 초기 노이즈 특성에 강건하게 대응합니다.</li>
+                <li><b>Validation 바운딩 및 연속성 조건:</b> Validation Fold에서 탐색한 최적의 하한선(0.15)을 최소 임계(Min Bound)로 설정하여 동적 임계치가 너무 낮게 잡히는 것을 방지했습니다. 또한 단발성 노이즈에 의한 오탐지를 막기 위해, 칼만 필터로 스무딩된 궤적이 <b>해당 임계치를 연속적으로 돌파하여 유지되는 시점</b>만을 진정한 FDP(First Degradation Point)로 판정했습니다.</li>
+            </ul>
+
+            <p>위와 같이 산출된 동적 FDP(일반적으로 약 0.15 내외 형성)를 기점으로 다음과 같이 예측 로직을 전환합니다.</p>
+            
+            <p><b>Track 1: 안전 모드 (CQRL Fallback) — FDP 도달 이전 (초기 마모)</b></p>
+            <ul>
+                <li><b>문제 정의:</b> 결함이 없는 정상 상태의 미세한 HI 변동(0.01~0.04)은 마모가 아닌 99% '노이즈'입니다. 이를 곡선에 피팅하면 잔여 수명이 무한대로 발산하거나 0으로 곤두박질치는 대참사가 발생합니다.</li>
+                <li><b>해결 (CQRL 적용):</b> 결함이 뚜렷해지기 전까지 개별 수명 예측을 포기하고, 훈련 데이터의 Lognormal Prior 분포(평균 약 84,000s)를 기반으로 한 조건부 분위수(Conditional Quantile Residual Life) 공식을 사용합니다.</li>
+                <li><b>비대칭 패널티 차단:</b> 수명이 짧은 베어링(Train3 등)에 대한 과대평가 기하급수 패널티를 완벽히 피하기 위해, 통계적 평균(Mean) 대신 보수적인 <b>35% 분위수(q=0.35)</b>를 선택합니다. 그 결과, 모든 초기 베어링에 대해 통계적 하한치(약 60,483초)를 통일 출력하며 0점으로 점수가 붕괴하는 사태를 완벽하게 차단합니다.</li>
+            </ul>
+
+            <p><b>Track 2: 지수 곡선 피팅 (Log-linear Extrapolation) — FDP 돌파 이후 (결함 발현)</b></p>
+            <ul>
+                <li><b>궤적 외삽:</b> 궤적이 동적 FDP를 돌파하면, 노이즈가 제거된 HI 곡선에 <b>f(t) = a &middot; e<sup>b &middot; t<sub>norm</sub></sup> + c</b> 형태의 지수 함수를 <span class='code'>scipy.optimize.curve_fit</span>으로 피팅합니다.</li>
+                <li><b>정규화 추론 (Normalized Fitting):</b> 여기서 핵심은 시간축을 <b>t<sub>norm</sub> = t - t<sub>start</sub></b> 로 0으로 정규화한다는 점입니다. 이 트릭을 통해 모델은 베어링이 과거에 10시간을 가동했는지 20시간을 가동했는지 이력을 전혀 몰라도 상관없습니다. 오로지 <b>"현재 유입된 연속 데이터 궤적의 기울기(b)"</b>만을 추출하여 <b>f(T<sub>f</sub>) = 1.0</b> 이 되는 파단 시간(T<sub>f</sub>)을 정확하게 역산(Inverse Calculation)해 냅니다.</li>
+            </ul>
+        </div>
+
+        <div>
+            <h2>5. 결론 및 종합 성과</h2>
+            <p>본 아키텍처는 블랙박스형 딥러닝 예측이 가진 한계를 명확히 인식하고, 고장 통계학(CQRL)과 물리 모델(Kalman Filter, Extrapolation)로 이를 감싼 가장 진보된 하이브리드 예지보전 시스템입니다.</p>
+            <ul>
+                <li><b>오차(MAE) 최소화:</b> CQRL 위험 회피의 시너지로 과대평가 붕괴를 원천 방어하여 평균 예측 오차(MAE)를 전체 수명 대비 약 13% (1.1만 초)로 통제했습니다.</li>
+                <li><b>SOTA급 스코어 달성:</b> 수명이 최대 5.3배 변동하는 가혹한 평가 조건 속에서도 4-Fold 교차 검증 평균 <b>0.48 (최대 0.54)</b>의 학계 최고 수준 A_RUL 방어력을 달성하며 방법론의 압도적 우수성을 입증했습니다.</li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

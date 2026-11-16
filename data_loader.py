@@ -1,101 +1,36 @@
-"""Unified data loader for HI prediction (TDMS data/ + parquet data2/).
+"""STFT 기반 PHM RUL 예측용 데이터 로딩."""
 
-Outputs per window:
-    X_vib  : (N, window, 4, VIBRATION_FEATURES_PER_CHANNEL=1026)
-    X_feat : (N, window, 4, HANDCRAFTED_DIM=10) - RPM-INDEPENDENT features only
-    hi     : (N,)  Health Indicator label in [0, 1]  (training target)
-    rul    : (N,)  True RUL in seconds              (for evaluation only)
-    metadata: case_name, source, start_timestep, end_timestep, time_sec, case_max
-
-RPM has been removed from the pipeline (RPM ablation showed it was not a usable
-signal). Bearing fault-frequency features (BPFO/BPFI/BSF/FTF, F_1X..F_3456X)
-have been dropped along with it; the 10 retained handcrafted features
-(RMS/kurtosis/crest/etc.) are all RPM-independent.
-
-Operation CSV is still read at training time to obtain `case_max` (the
-ground-truth lifetime needed for HI labels). At inference time no CSV is
-required - the model predicts HI from vibration alone.
-"""
-
-from __future__ import annotations
-
-import hashlib
 import re
-from datetime import datetime
-from io import StringIO
+import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from nptdms import TdmsFile
 
-from config import (
-    HI_ALPHA,
-    DATA2_DIR,
-    DATA2_FEATURE_CACHE_DIR,
-    DEGRADATION_BASELINE_TIMESTEPS,
-    HANDCRAFTED_DIM,
-    HANDCRAFTED_FEATURES,
-    HI_DAMAGE_SCALE,
-    HI_FEATURES_ENABLED,
-    HI_LABEL_MODE,
-    HI_LABEL_POWER,
-    HI_SMOOTH_WINDOW,
-    SAMPLING_RATE,
-    TDMS_CHUNK_SAMPLES,
-    TDMS_CHUNK_SECONDS,
-    TDMS_CHUNKS_PER_FILE,
-    TDMS_CYCLE_SECONDS,
-    TRAIN_DIR,
-    VIBRATION_FEATURES_PER_CHANNEL,
-)
-
-
-def _tdms_wallclock_times(n_steps: int) -> np.ndarray:
-    """**Training TDMS** chunk i 의 wall-clock 시간 (초).
-
-    Train/Val (data/Train): 1분 측정 + 9분 휴식 = 10분 cycle. file = 6 chunks (10s).
-        wall_clock(i) = (i // 6) × CYCLE + (i % 6) × CHUNK_SECONDS
-    Test 데이터는 *연속 측정* 이므로 _continuous_times() 를 사용 (이 함수 NO).
-    """
-    file_idx  = np.arange(n_steps, dtype=np.int64) // TDMS_CHUNKS_PER_FILE
-    chunk_idx = np.arange(n_steps, dtype=np.int64) %  TDMS_CHUNKS_PER_FILE
-    return (file_idx * TDMS_CYCLE_SECONDS + chunk_idx * TDMS_CHUNK_SECONDS).astype(np.float32)
-
-
-def _continuous_times(n_steps: int) -> np.ndarray:
-    """**Test / Validation** chunk i 의 wall-clock 시간 (초).
-
-    대회 명세: Test/Validation 은 *시간적으로 연속된* 데이터 (휴식 없음).
-        t(i) = i × CHUNK_SECONDS
-    Training cycle 가정을 그대로 적용하면 lifetime 을 ~10배 over-estimate 하여
-    Stage 2 RUL 외삽이 부정확해짐.
-    """
-    return (np.arange(n_steps, dtype=np.int64) * TDMS_CHUNK_SECONDS).astype(np.float32)
-from features.degradation import augment_with_degradation, compute_global_baseline
-from features.vibration import bearing_fault_amplitudes, shaft_harmonic_amplitudes, stft_magnitude_vector
+from config import OPERATION_FEATURES, TRAIN_DIR
+from features import operation_vector, vibration_stft_timestep
 
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949")
-DATA2_CHANNELS = ("CH03", "CH04", "CH05", "CH06")
-TDMS_CHANNELS = ("CH1", "CH2", "CH3", "CH4")
-DATA2_TIMESTEP_SECONDS = 10.0
 
 
-# ============================================================================
-# TDMS / Operation CSV helpers
-# ============================================================================
-
-
-def load_tdms_channels(file_path) -> Dict[str, np.ndarray]:
-    """Read TDMS file -> {channel_name: samples_array}."""
+def load_tdms_file(file_path):
+    """작은 TDMS 테스트용 기본 로딩. 대용량 파일에는 사용하지 않는다."""
     tdms_file = TdmsFile.read(file_path)
-    out: Dict[str, np.ndarray] = {}
+    df = tdms_file.as_dataframe()
+    return df
+
+
+def load_tdms_channels(file_path):
+    """대용량 대응 TDMS 로딩. 파일을 dataframe으로 만들지 않고 채널만 읽는다."""
+    tdms_file = TdmsFile.read(file_path)
+    data = {}
     for group in tdms_file.groups():
         for channel in group.channels():
-            out[channel.name] = channel[:]
-    return out
+            data[channel.name] = channel[:]
+    return data
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -110,25 +45,43 @@ def _read_csv(path: Path) -> pd.DataFrame:
 
 def _find_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
     normalized = {str(col).strip().lower(): col for col in columns}
-    for cand in candidates:
-        if cand.lower() in normalized:
-            return normalized[cand.lower()]
+    for candidate in candidates:
+        if candidate.lower() in normalized:
+            return normalized[candidate.lower()]
     for col in columns:
         col_lower = str(col).strip().lower()
-        if any(cand.lower() in col_lower for cand in candidates):
+        if any(candidate.lower() in col_lower for candidate in candidates):
             return col
     return None
 
 
 def load_operation_csv(csv_path: Path) -> pd.DataFrame:
-    """Read TDMS operation CSV; only time_sec is needed for HI labels."""
+    """운전 CSV를 읽고 컬럼명을 표준화한다."""
     df = _read_csv(csv_path)
-    time_col = _find_column(df.columns, ("time_sec", "time", "sec"))
-    if time_col is None:
-        raise ValueError(f"{csv_path} must contain a time/sec column.")
-    df = df.rename(columns={time_col: "time_sec"})
-    df["time_sec"] = pd.to_numeric(df["time_sec"], errors="coerce").fillna(0.0)
+    mapping = {
+        _find_column(df.columns, ("time_sec", "time", "sec")): "time_sec",
+        _find_column(df.columns, ("torque",)): "torque",
+        _find_column(df.columns, ("speed", "rpm")): "speed",
+        _find_column(df.columns, ("temp_front", "front")): "temp_front",
+        _find_column(df.columns, ("temp_rear", "rear")): "temp_rear",
+    }
+    mapping = {old: new for old, new in mapping.items() if old is not None}
+    df = df.rename(columns=mapping)
+
+    if "time_sec" not in df.columns:
+        raise ValueError(f"{csv_path} must contain time_sec or an equivalent time column.")
+
+    for column in ("time_sec", "torque", "speed", "temp_front", "temp_rear"):
+        if column not in df.columns:
+            df[column] = 0.0
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+
     return df.sort_values("time_sec").reset_index(drop=True)
+
+
+def compute_rul(operation_df: pd.DataFrame, current_time: float) -> float:
+    """RUL = max_time - current_time."""
+    return float(operation_df["time_sec"].max() - current_time)
 
 
 def _case_name_from_operation(csv_path: Path) -> str:
@@ -142,766 +95,381 @@ def _find_vibration_dir(case_name: str, root_dir: Path) -> Optional[Path]:
         root_dir / case_name / case_name,
         root_dir / case_name,
     ]
-    for cand in candidates:
-        if cand.exists() and any(cand.glob("*.tdms")):
-            return cand
-    for cand in sorted(root_dir.rglob(f"{case_name}*")):
-        if cand.is_dir() and any(cand.glob("*.tdms")):
-            return cand
+    for candidate in candidates:
+        if candidate.exists() and any(candidate.glob("*.tdms")):
+            return candidate
+    for candidate in sorted(root_dir.rglob(f"{case_name}*")):
+        if candidate.is_dir() and any(candidate.glob("*.tdms")):
+            return candidate
     return None
 
 
 def discover_cases(root_dir: Path) -> List[Tuple[str, Path, Path]]:
-    """Discover TDMS train cases (case_name, csv_path, vibration_dir)."""
+    """운전 CSV와 TDMS 진동 폴더가 모두 있는 case를 찾는다."""
     root_dir = Path(root_dir)
     cases = []
     for csv_path in sorted(root_dir.glob("*_Operation.csv")):
         case_name = _case_name_from_operation(csv_path)
-        vib_dir = _find_vibration_dir(case_name, root_dir)
-        if vib_dir is not None:
-            cases.append((case_name, csv_path, vib_dir))
+        vibration_dir = _find_vibration_dir(case_name, root_dir)
+        if vibration_dir is not None:
+            cases.append((case_name, csv_path, vibration_dir))
     return cases
 
 
-# ============================================================================
-# Handcrafted PHM feature extraction (RPM-independent only)
-# ============================================================================
-
-
-_FEATURE_ALIASES = {
-    "PEAKTOPEAK": "PEAK_TO_PEAK",
-    "ABS.MEAN": "ABS_MEAN",
-    "ABSMEAN": "ABS_MEAN",
-    "ABS.MAX": "ABS_MAX",
-    "ABSMAX": "ABS_MAX",
-}
-
-
-def _clean_feature_name(name: str) -> str:
-    text = str(name).strip().upper().replace(" ", "_").replace("-", "_")
-    compact = re.sub(r"[^A-Z0-9.]+", "", text)
-    return _FEATURE_ALIASES.get(compact, text.replace(".", "_"))
-
-
-FEATURE_INDEX = {_clean_feature_name(name): i for i, name in enumerate(HANDCRAFTED_FEATURES)}
-
-
-def _safe_float(value: object, default: float = 0.0) -> float:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return default
-    return v if np.isfinite(v) else default
-
-
-def _parse_datetime(value: object) -> Optional[datetime]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%y%m%d_%H%M%S", "%Y%m%d_%H%M%S"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            pass
-    try:
-        return pd.to_datetime(text).to_pydatetime()
-    except Exception:
-        return None
-
-
-def _amplitude_band(signal: np.ndarray, low: float, high: float) -> float:
-    if signal.size < 4:
-        return 0.0
-    arr = np.asarray(signal, dtype=np.float32)
-    spectrum = np.abs(np.fft.rfft(arr))
-    freqs = np.fft.rfftfreq(arr.size, d=1.0 / SAMPLING_RATE)
-    mask = (freqs >= low) & (freqs <= high)
-    if not np.any(mask):
-        return 0.0
-    return float(np.mean(spectrum[mask]) / max(arr.size, 1))
-
-
-def handcrafted_features_from_signal(signal: Iterable[float]) -> np.ndarray:
-    """10 statistics + 6 bearing fault amplitudes + 3 shaft harmonic order features = 19-dim."""
-    arr = np.asarray(signal, dtype=np.float32)
-    arr = arr[np.isfinite(arr)]
-    out = np.zeros(HANDCRAFTED_DIM, dtype=np.float32)
-    if arr.size == 0:
-        return out
-
-    mean = float(np.mean(arr))
-    centered = arr - mean
-    std = float(np.std(arr))
-    rms = float(np.sqrt(np.mean(arr ** 2)))
-    abs_mean = float(np.mean(np.abs(arr)))
-    abs_max = float(np.max(np.abs(arr)))
-    p2p = float(np.ptp(arr))
-    skew = float(np.mean(centered ** 3) / (std ** 3 + 1e-12)) if std > 0 else 0.0
-    kurt = float(np.mean(centered ** 4) / (std ** 4 + 1e-12)) if std > 0 else 0.0
-
-    values = {
-        "RMS": rms,
-        "PEAK_TO_PEAK": p2p,
-        "ABS_MEAN": abs_mean,
-        "SKEW": skew,
-        "KURT": kurt,
-        "CREST": abs_max / (rms + 1e-12),
-        "IMPULSE": abs_max / (abs_mean + 1e-12),
-        "SHAPE": rms / (abs_mean + 1e-12),
-        "ABS_MAX": abs_max,
-        "RMS_HIGH": _amplitude_band(arr, 5_000.0, SAMPLING_RATE / 2.0),
-    }
-    for name, value in values.items():
-        out[FEATURE_INDEX[name]] = _safe_float(value)
-
-    arr64 = arr.astype(np.float64)
-    # Bearing fault frequency amplitudes (order-aligned to estimated shaft RPM)
-    fault_amps = bearing_fault_amplitudes(arr64, SAMPLING_RATE)
-    for i, name in enumerate(("BPFI_1X", "BPFI_2X", "BPFO_1X", "BPFO_2X", "BSF_1X", "FTF_1X")):
-        out[FEATURE_INDEX[name]] = _safe_float(fault_amps[i])
-
-    # Shaft harmonic order energy (1×/2×/3× shaft freq — RPM-invariant)
-    shaft_amps = shaft_harmonic_amplitudes(arr64, SAMPLING_RATE)
-    for i, name in enumerate(("SHAFT_1X", "SHAFT_2X", "SHAFT_3X")):
-        out[FEATURE_INDEX[name]] = _safe_float(shaft_amps[i])
-
-    return out
-
-
-# ============================================================================
-# HI label generation
-# ============================================================================
-
-
-def _rms_baseline_and_trajectory(feat_raw: np.ndarray) -> tuple[float, np.ndarray]:
-    """RMS healthy baseline (mean of first N) and per-timestep avg-channel RMS.
-
-    feat_raw shape: (T, C, F) raw 10-dim features. F=HANDCRAFTED_DIM.
-    Returns (baseline_scalar, per_timestep_rms).
-    """
-    rms_idx = FEATURE_INDEX["RMS"]
-    rms_per_step = feat_raw[:, :, rms_idx].mean(axis=1).astype(np.float64)
-    n_base = min(DEGRADATION_BASELINE_TIMESTEPS, len(rms_per_step))
-    baseline = float(np.mean(rms_per_step[:n_base])) if n_base > 0 else 0.0
-    return baseline, rms_per_step
-
-
-def _norm01(arr: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    lo, hi = float(arr.min()), float(arr.max())
-    if hi - lo < eps:
-        return np.zeros_like(arr, dtype=np.float64)
-    return (arr - lo) / (hi - lo)
-
-
-def _compute_composite_hi(feat_raw: np.ndarray, smooth_window: int = HI_SMOOTH_WINDOW) -> np.ndarray:
-    """Cumulative damage accumulation HI.
-
-    Instantaneous damage rate per timestep (positive z-score deviations from
-    healthy baseline only, via ReLU) is accumulated via cumsum so HI reflects
-    "how much total damage has built up" rather than "current feature value".
-    This prevents the step-function / plateau collapse seen when using
-    instantaneous _norm01 values on sudden-failure bearings.
-
-    damage_rate_t = 0.45 * relu(bpf_zscore)   # BPFI+BPFO — most fault-specific
-                  + 0.25 * relu(kurt_zscore)   # impulsiveness
-                  + 0.20 * relu(rms_zscore)    # broadband energy
-                  + 0.10 * relu(rms_high_zscore)  # high-freq envelope
-
-    hi = cummax(smooth(cumsum(damage_rate))) → [0, 1]
-
-    z-scores use the first DEGRADATION_BASELINE_TIMESTEPS steps as the
-    healthy reference. ReLU suppresses normal fluctuations around baseline so
-    only genuine degradation contributes to the integral.
-    If no measurable damage is detected, falls back to linear time fraction.
-    """
-    from scipy.ndimage import uniform_filter1d
-
-    T = feat_raw.shape[0]
-    if T == 0:
-        return np.zeros(0, dtype=np.float32)
-
-    n_base = min(DEGRADATION_BASELINE_TIMESTEPS, T)
-
-    def _feat(name: str) -> np.ndarray:
-        idx = FEATURE_INDEX.get(name)
-        if idx is None:
-            return np.zeros(T, dtype=np.float64)
-        return feat_raw[:, :, idx].mean(axis=1).astype(np.float64)
-
-    def _zscore(signal: np.ndarray) -> np.ndarray:
-        mu    = float(np.mean(signal[:n_base]))
-        sigma = float(np.std(signal[:n_base])) + 1e-9
-        return (signal - mu) / sigma
-
-    # Bearing fault band energy: BPFI (1X+2X) + BPFO (1X+2X)
-    bpf_energy = (_feat("BPFI_1X") + _feat("BPFI_2X") +
-                  _feat("BPFO_1X") + _feat("BPFO_2X"))
-
-    bpf_damage  = np.maximum(_zscore(bpf_energy),       0.0)
-    kurt_damage = np.maximum(_zscore(_feat("KURT")),     0.0)
-    rms_damage  = np.maximum(_zscore(_feat("RMS")),      0.0)
-    hi_damage   = np.maximum(_zscore(_feat("RMS_HIGH")), 0.0)
-
-    damage_rate = (0.45 * bpf_damage  +
-                   0.25 * kurt_damage +
-                   0.20 * rms_damage  +
-                   0.10 * hi_damage)
-
-    cum_damage = np.cumsum(damage_rate)
-
-    # Stage 2 파이프라인을 위해 순수 물리 손상만 사용.
-    # 선형 성분을 제거하면 초반 flat → 후반 급상승 (hockey-stick) 형태가 됨.
-    # Stage 2 지수 피팅이 이 형태에서 정확히 동작한다.
-    # fallback: 물리 손상이 거의 없는 케이스 (전기 결함 없음) → linear
-    time_fraction = np.linspace(0.0, 1.0, T)
-
-    if float(cum_damage[-1]) < 1e-9:
-        return time_fraction.astype(np.float32)
-
-    cum_damage = cum_damage / cum_damage[-1]   # 순수 물리 손상, 선형 혼합 없음
-
-    if smooth_window > 1 and T >= smooth_window:
-        cum_smooth = uniform_filter1d(cum_damage, size=smooth_window, mode="nearest")
-    else:
-        cum_smooth = cum_damage
-
-    # cumsum is monotone by construction (relu ≥ 0), but smoothing can locally
-    # decrease — enforce monotonicity before final normalisation.
-    hi_mono = np.maximum.accumulate(cum_smooth)
-    return _norm01(hi_mono).astype(np.float32)
-
-
-def compute_hi_labels(
-    times: np.ndarray,
-    case_max: float,
-    feat_raw: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Per-timestep HI label in [0, 1].
-
-    "exponential" — HI(t) = (e^(α·t/T_max) - 1) / (e^α - 1), α=HI_ALPHA.
-                    Convex shape: stays low early, accelerates near failure.
-                    Consistent across all cases → Stage 2 curve fitting stable.
-    "composite"   — multi-feature blend (rms+kurtosis+bpfo+envelope) → cummax →
-                    smooth → [0,1].
-    "damage"      — legacy cumulative RMS damage.
-    "hybrid"      — 0.5*linear + 0.5*damage.
-    "linear"      — time fraction only (case-dependent, not recommended).
-    """
-    progress = np.clip(times / max(case_max, 1.0), 0.0, 1.0).astype(np.float32)
-
-    if HI_LABEL_MODE == "exponential":
-        # HI(t) = (e^(α·progress) - 1) / (e^α - 1)
-        alpha = float(HI_ALPHA)
-        denom = float(np.exp(alpha) - 1.0)
-        hi = (np.exp(alpha * progress.astype(np.float64)) - 1.0) / denom
-        return np.clip(hi, 0.0, 1.0).astype(np.float32)
-    if HI_LABEL_MODE == "linear":
-        return progress
-    if HI_LABEL_MODE == "power":
-        return np.power(progress, HI_LABEL_POWER, dtype=np.float32)
-    if HI_LABEL_MODE == "composite":
-        if feat_raw is None:
-            raise ValueError("HI_LABEL_MODE='composite' requires feat_raw")
-        return _compute_composite_hi(feat_raw)
-    if HI_LABEL_MODE in ("damage", "hybrid"):
-        if feat_raw is None:
-            raise ValueError(f"HI_LABEL_MODE={HI_LABEL_MODE} requires feat_raw")
-        baseline, rms_per_step = _rms_baseline_and_trajectory(feat_raw)
-        if baseline < 1e-9:
-            cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
-        else:
-            positive_dev = np.maximum(rms_per_step - baseline, 0.0)
-            cum_damage = np.cumsum(positive_dev).astype(np.float64)
-            final_cum = float(cum_damage[-1]) if len(cum_damage) > 0 else 0.0
-            if final_cum > 1e-9:
-                cum_damage_norm = (cum_damage / final_cum).astype(np.float32)
-            else:
-                cum_damage_norm = np.zeros_like(rms_per_step, dtype=np.float32)
-        if HI_LABEL_MODE == "damage":
-            return cum_damage_norm
-        return (0.5 * progress + 0.5 * cum_damage_norm).astype(np.float32)
-
-    raise ValueError(f"Unknown HI_LABEL_MODE: {HI_LABEL_MODE}")
-
-
-# ============================================================================
-# Per-case cache
-# ============================================================================
-
-
-CACHE_VERSION = "v9_orderdomain"
-
-
-def _cache_key(paths: Iterable[Path], extra: str) -> str:
-    digest = hashlib.md5(extra.encode("utf-8"))
-    for path in sorted(Path(p) for p in paths if Path(p).exists()):
-        st = path.stat()
-        digest.update(str(path.resolve()).encode("utf-8"))
-        digest.update(str(st.st_size).encode("ascii"))
-    return digest.hexdigest()
-
-
-def _save_case_cache(path: Path, vib: np.ndarray, feat: np.ndarray,
-                     times: np.ndarray, case_max: float, meta: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        path,
-        vib=vib.astype(np.float32),
-        feat=feat.astype(np.float32),
-        times=times.astype(np.float32),
-        case_max=np.float32(case_max),
-        metadata_json=meta.to_json(orient="records", force_ascii=True),
-    )
-
-
-def _load_case_cache(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, pd.DataFrame]:
-    data = np.load(path, allow_pickle=False)
-    meta = pd.read_json(StringIO(data["metadata_json"].item()))
-    return (
-        data["vib"], data["feat"], data["times"],
-        float(data["case_max"]), meta,
-    )
-
-
-def _parquet():
-    try:
-        import pyarrow.parquet as pq
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "pyarrow is required for data2 parquet loading. "
-            "Install with: python -m pip install pyarrow"
-        ) from exc
-    return pq
-
-
-# ============================================================================
-# Per-case extractors
-# ============================================================================
-
-
-def load_original_case_timesteps(
-    case_name: str,
-    operation_csv: Path,
-    vibration_dir: Path,
-    use_cache: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, pd.DataFrame]:
-    """TDMS train case -> (vib, feat, times, case_max, meta) per chunk."""
-    tdms_files = sorted(Path(vibration_dir).glob("*.tdms"))
-    op_df = load_operation_csv(operation_csv)
-    key = _cache_key([operation_csv, *tdms_files], f"orig:{case_name}:{CACHE_VERSION}")
-    cache_path = DATA2_FEATURE_CACHE_DIR / f"original_{case_name}_{key}.npz"
-    if use_cache and cache_path.exists():
-        vib, feat, _old_times, case_max, meta = _load_case_cache(cache_path)
-        # times 만 wall-clock 으로 overwrite (cache 의 등간격 times 는 무효).
-        # STFT/feat 는 그대로 — cache 정책상 그것만 바뀔 때 CACHE_VERSION ↑.
-        times = _tdms_wallclock_times(len(_old_times))
-        meta = meta.copy()
-        meta["time_sec"] = times
-        return vib, feat, times, case_max, meta
-
-    n_files = len(tdms_files)
-    n_steps = n_files * TDMS_CHUNKS_PER_FILE
-    if n_steps == 0:
-        raise ValueError(f"No TDMS files in {vibration_dir}")
-
-    case_max = float(op_df["time_sec"].max())
-    # Wall-clock times: TDMS 1분 측정 + 9분 휴식 cycle 반영
-    # (등간격 linspace 가정은 file 내 6 chunks 의 시간을 약 10배 펴서 HI/stage 라벨 부정확)
-    times = _tdms_wallclock_times(n_steps)
-    # 마지막 chunk wall-clock 보다 case_max (op CSV) 가 약간 큼 (휴식 일부 포함). 그대로 유지.
-
-    vib_steps = np.zeros((n_steps, len(TDMS_CHANNELS), VIBRATION_FEATURES_PER_CHANNEL), dtype=np.float32)
-    feat_steps = np.zeros((n_steps, len(TDMS_CHANNELS), HANDCRAFTED_DIM), dtype=np.float32)
-
-    for file_idx, tdms_path in enumerate(tdms_files):
-        chans = load_tdms_channels(tdms_path)
-        normalized = {name.upper(): np.asarray(v, dtype=np.float32) for name, v in chans.items()}
-        ch_arrays = [normalized.get(ch, np.array([], dtype=np.float32)) for ch in TDMS_CHANNELS]
-        for chunk_idx in range(TDMS_CHUNKS_PER_FILE):
-            gstep = file_idx * TDMS_CHUNKS_PER_FILE + chunk_idx
-            start = chunk_idx * TDMS_CHUNK_SAMPLES
-            end = start + TDMS_CHUNK_SAMPLES
-            for ch_i, ch_arr in enumerate(ch_arrays):
-                chunk = ch_arr[start:end] if ch_arr.size >= end else ch_arr[start:]
-                vib_steps[gstep, ch_i] = stft_magnitude_vector(chunk)
-                feat_steps[gstep, ch_i] = handcrafted_features_from_signal(chunk)
-
-    meta = pd.DataFrame({
-        "case_name": case_name,
-        "source": "original",
-        "timestep_idx": np.arange(n_steps),
-        "time_sec": times,
-    })
-    result = (np.nan_to_num(vib_steps), np.nan_to_num(feat_steps), times, case_max, meta)
-    if use_cache:
-        _save_case_cache(cache_path, *result)
-    return result
-
-
-def load_data2_case_timesteps(
-    case_dir: Path,
-    use_cache: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, pd.DataFrame]:
-    """data2 parquet case -> (vib, feat, times, case_max, meta) per timestep."""
-    case_dir = Path(case_dir)
-    case_name = case_dir.name
-    op_path = case_dir / "operation.parquet"
-    vib_path = case_dir / "vibration.parquet"
-    key = _cache_key([op_path, vib_path], f"data2:{case_name}:{CACHE_VERSION}")
-    cache_path = DATA2_FEATURE_CACHE_DIR / f"data2_{case_name}_{key}.npz"
-    if use_cache and cache_path.exists():
-        return _load_case_cache(cache_path)
-
-    pq = _parquet()
-    op_df = pq.read_table(op_path).to_pandas().sort_values("timestep_idx").reset_index(drop=True)
-    n_steps = int(op_df["timestep_idx"].max()) + 1
-
-    vib_steps = np.zeros(
-        (n_steps, len(DATA2_CHANNELS), stft_magnitude_vector(np.zeros(1024, dtype=np.float32)).shape[0]),
-        dtype=np.float32,
-    )
-    feat_steps = np.zeros((n_steps, len(DATA2_CHANNELS), HANDCRAFTED_DIM), dtype=np.float32)
-    dt_by_step: Dict[int, datetime] = {}
-
-    pf = pq.ParquetFile(vib_path)
-    for group_idx in range(pf.num_row_groups):
-        table = pf.read_row_group(group_idx, columns=["timestep_idx", "datetime", "channel", "samples"])
-        for row in table.to_pylist():
-            ts = int(row["timestep_idx"])
-            channel = str(row["channel"])
-            if ts < 0 or ts >= n_steps or channel not in DATA2_CHANNELS:
-                continue
-            ch_idx = DATA2_CHANNELS.index(channel)
-            samples = np.asarray(row["samples"], dtype=np.float32)
-            vib_steps[ts, ch_idx] = stft_magnitude_vector(samples)
-            feat_steps[ts, ch_idx] = handcrafted_features_from_signal(samples)
-            parsed = _parse_datetime(row.get("datetime"))
-            if parsed is not None:
-                dt_by_step.setdefault(ts, parsed)
-
-    if len(dt_by_step) >= 2:
-        first_dt = min(dt_by_step.values())
-        last_dt = max(dt_by_step.values())
-        times = np.zeros(n_steps, dtype=np.float32)
-        for i in range(n_steps):
-            cur = dt_by_step.get(i)
-            times[i] = (i * DATA2_TIMESTEP_SECONDS) if cur is None \
-                else float((cur - first_dt).total_seconds())
-        case_max = float((last_dt - first_dt).total_seconds())
-        if case_max > times[-1]:
-            times[-1] = case_max
-    else:
-        times = np.arange(n_steps, dtype=np.float32) * DATA2_TIMESTEP_SECONDS
-        case_max = float(times[-1])
-
-    meta = pd.DataFrame({
-        "case_name": case_name,
-        "source": "data2",
-        "timestep_idx": np.arange(n_steps),
-        "time_sec": times,
-    })
-    result = (np.nan_to_num(vib_steps), np.nan_to_num(feat_steps), times, case_max, meta)
-    if use_cache:
-        _save_case_cache(cache_path, *result)
-    return result
-
-
-def discover_tdms_inference_cases(test_dir: Path) -> List[Tuple[str, Path]]:
-    """Find TDMS-only inference cases (no operation CSV) under data/Test."""
-    test_dir = Path(test_dir)
-    cases: List[Tuple[str, Path]] = []
-    if not test_dir.exists():
-        return cases
-    for child in sorted(test_dir.iterdir()):
+def discover_vibration_cases(root_dir: Path) -> List[Tuple[str, Path]]:
+    """Find validation/test cases that contain TDMS files without requiring operation CSVs."""
+    root_dir = Path(root_dir)
+    cases = []
+
+    for child in sorted(root_dir.iterdir()):
         if not child.is_dir():
             continue
-        if any(child.glob("*.tdms")):
-            cases.append((child.name, child))
-            continue
-        for grand in sorted(child.iterdir()):
-            if grand.is_dir() and any(grand.glob("*.tdms")):
-                cases.append((child.name, grand))
-                break
-    return cases
+        vibration_dir = _find_vibration_dir(child.name, root_dir)
+        if vibration_dir is not None:
+            cases.append((child.name, vibration_dir))
+
+    if cases:
+        order = sort_cases_for_submission([name for name, _ in cases])
+        name_to_dir = dict(cases)
+        return [(name, name_to_dir[name]) for name in order]
+
+    if any(root_dir.glob("*.tdms")):
+        return [(root_dir.name, root_dir)]
+
+    return []
 
 
-def load_original_inference_case(
+def _parse_tdms_file_index(tdms_path: Path) -> Optional[int]:
+    """TDMS 파일명에서 숫자 인덱스 추출 (예: 000126.tdms → 126)."""
+    stem = tdms_path.stem
+    if stem.isdigit():
+        return int(stem)
+    match = re.search(r"(\d+)", stem)
+    return int(match.group(1)) if match else None
+
+
+def _detect_tdms_index_gaps(tdms_files: List[Path]) -> List[int]:
+    """연속되지 않는 인덱스(누락 파일) 목록."""
+    indices = [_parse_tdms_file_index(p) for p in tdms_files]
+    if not indices or any(i is None for i in indices):
+        return []
+    sorted_idx = sorted(set(indices))
+    gaps = []
+    for expected in range(sorted_idx[0], sorted_idx[-1] + 1):
+        if expected not in sorted_idx:
+            gaps.append(expected)
+    return gaps
+
+
+def _time_from_tdms_index(index: int, max_time: float, total_files: int) -> float:
+    if total_files <= 1:
+        return max_time
+    return max_time * index / float(total_files - 1)
+
+
+def _align_tdms_times(
+    tdms_files: List[Path],
+    operation_df: pd.DataFrame,
     case_name: str,
+) -> List[float]:
+    """
+    TDMS 파일별 time_sec 정렬.
+
+    1) 파일명 숫자 인덱스 → [0, max_time] 선형 매핑 (누락 구간은 실제 파일만 사용)
+    2) train4 등 공지된 누락 케이스: 인덱스 갭 경고
+    3) 폴백: 파일 순서 기반 선형 매핑
+    4) 보조: 10분(600s) 간격으로 CSV time_sec 보간
+    """
+    max_time = float(operation_df["time_sec"].max())
+    n = len(tdms_files)
+    if n == 0:
+        return []
+
+    indices = [_parse_tdms_file_index(p) for p in tdms_files]
+    gaps = _detect_tdms_index_gaps(tdms_files)
+    if gaps and case_name in CASES_WITH_KNOWN_MISSING_TDMS:
+        warnings.warn(
+            f"[{case_name}] TDMS index gap(s) detected (known dataset issue): missing {gaps[-3:]}{'...' if len(gaps) > 3 else ''}",
+            stacklevel=2,
+        )
+    elif gaps:
+        warnings.warn(
+            f"[{case_name}] TDMS index gap(s): {gaps[-3:]}{'...' if len(gaps) > 3 else ''}",
+            stacklevel=2,
+        )
+
+    if indices and all(i is not None for i in indices):
+        min_idx, max_idx = min(indices), max(indices)
+        if max_idx > min_idx:
+            times = [max_time * (idx - min_idx) / float(max_idx - min_idx) for idx in indices]
+            return times
+
+    # 순서 기반 선형 매핑
+    times = [_time_from_tdms_index(i, max_time, n) for i in range(n)]
+
+    # CSV time_sec과 600s 간격 앵커로 미세 보정 (가능한 경우)
+    if max_time > 0 and n > 1:
+        csv_times = operation_df["time_sec"].to_numpy(dtype=np.float64)
+        for i, t in enumerate(times):
+            anchor = min(i * TDMS_ACQUISITION_INTERVAL_SEC, max_time)
+            nearest = csv_times[np.argmin(np.abs(csv_times - anchor))]
+            times[i] = float(0.7 * t + 0.3 * nearest)
+
+    return times
+
+
+def _case_timesteps(
+    operation_csv: Path,
     vibration_dir: Path,
-    use_cache: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """TDMS inference case (no CSV) -> (vib, feat, times, meta) per chunk."""
-    tdms_files = sorted(Path(vibration_dir).glob("*.tdms"))
-    if not tdms_files:
-        raise ValueError(f"No TDMS files in {vibration_dir}")
+    max_files: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    TDMS 파일별 timestep 생성.
+    진동 shape: (num_steps, 4, freq_bins), 운전 shape: (num_steps, 6)
+    """
+    operation_df = load_operation_csv(operation_csv)
+    max_time = float(operation_df["time_sec"].max())
+    all_tdms_files = sorted(Path(vibration_dir).glob("*.tdms"))
+    if not all_tdms_files:
+        raise ValueError(f"No TDMS files found in {vibration_dir}")
 
-    key = _cache_key(tdms_files, f"orig_inf:{case_name}:{CACHE_VERSION}")
-    cache_path = DATA2_FEATURE_CACHE_DIR / f"original_inference_{case_name}_{key}.npz"
-    if use_cache and cache_path.exists():
-        vib, feat, _old_times, _case_max, meta = _load_case_cache(cache_path)
-        # Test 는 연속 측정 — 학습 cycle 가정과 다름. 매 load 시 재계산.
-        times = _continuous_times(len(_old_times))
-        meta = meta.copy()
-        meta["time_sec"] = times
-        return vib, feat, times, meta
+    total_files = len(all_tdms_files)
+    tdms_files = all_tdms_files[:max_files] if max_files is not None else all_tdms_files
 
-    n_files = len(tdms_files)
-    n_steps = n_files * TDMS_CHUNKS_PER_FILE
+    vibration_steps = []
+    operation_steps = []
+    times = []
+    previous_time = None
 
-    vib_steps = np.zeros((n_steps, len(TDMS_CHANNELS), VIBRATION_FEATURES_PER_CHANNEL), dtype=np.float32)
-    feat_steps = np.zeros((n_steps, len(TDMS_CHANNELS), HANDCRAFTED_DIM), dtype=np.float32)
+    case_name = _case_name_from_operation(operation_csv)
+    aligned_times = _align_tdms_times(tdms_files, operation_df, case_name)
 
-    for file_idx, tdms_path in enumerate(tdms_files):
-        chans = load_tdms_channels(tdms_path)
-        normalized = {name.upper(): np.asarray(v, dtype=np.float32) for name, v in chans.items()}
-        ch_arrays = [normalized.get(ch, np.array([], dtype=np.float32)) for ch in TDMS_CHANNELS]
-        for chunk_idx in range(TDMS_CHUNKS_PER_FILE):
-            gstep = file_idx * TDMS_CHUNKS_PER_FILE + chunk_idx
-            start = chunk_idx * TDMS_CHUNK_SAMPLES
-            end = start + TDMS_CHUNK_SAMPLES
-            for ch_i, ch_arr in enumerate(ch_arrays):
-                chunk = ch_arr[start:end] if ch_arr.size >= end else ch_arr[start:]
-                vib_steps[gstep, ch_i] = stft_magnitude_vector(chunk)
-                feat_steps[gstep, ch_i] = handcrafted_features_from_signal(chunk)
+    for index, tdms_path in enumerate(tdms_files):
+        current_time = aligned_times[index]
+        vibration_steps.append(vibration_stft_timestep(tdms_path))
+        operation_steps.append(operation_vector(operation_df, current_time, previous_time))
+        times.append(current_time)
+        previous_time = current_time
 
-    # Test/Validation 은 *연속 측정* (대회 명세). cycle 가정 적용 금지.
-    times = _continuous_times(n_steps)
-    meta = pd.DataFrame({
-        "case_name": case_name,
-        "source": "original_inference",
-        "timestep_idx": np.arange(n_steps),
-        "time_sec": times,
-    })
-    case_max = float(times[-1])
-    result = (np.nan_to_num(vib_steps), np.nan_to_num(feat_steps), times, case_max, meta)
-    if use_cache:
-        _save_case_cache(cache_path, *result)
-    return result[0], result[1], result[2], result[4]
+    return (
+        np.asarray(vibration_steps, dtype=np.float32),
+        np.asarray(operation_steps, dtype=np.float32),
+        np.asarray(times, dtype=np.float32),
+    )
 
 
-# ============================================================================
-# Sliding window builder
-# ============================================================================
-
-
-def _build_windows(
-    vib: np.ndarray,
-    feat_aug: np.ndarray,
-    feat_raw: np.ndarray,
-    times: np.ndarray,
-    case_max: float,
+def build_case_sequences(
+    operation_csv: Path,
+    vibration_dir: Path,
     case_name: str,
-    source: str,
     window_size: int,
     stride: int,
     max_samples: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Return (X_vib, X_feat, hi, rul, metadata) per window.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    """정렬된 진동/운전 timestep에 sliding window를 적용한다."""
+    operation_df = load_operation_csv(operation_csv)
+    max_files = None
+    if max_samples is not None:
+        max_files = window_size + max(0, max_samples - 1) * stride
 
-    HI label is read at the END timestep of each window from a per-timestep HI
-    sequence computed once per case (cheap and consistent across windows).
-    feat_aug = augmented features (HI-augmented, used as model input).
-    feat_raw = raw 10-dim features (used to compute damage HI label).
-    """
-    hi_per_step = compute_hi_labels(times, case_max, feat_raw=feat_raw)
+    vibration_steps, operation_steps, times = _case_timesteps(
+        operation_csv,
+        vibration_dir,
+        max_files=max_files,
+    )
 
-    X_vib, X_feat, hi, rul, rows = [], [], [], [], []
+    X_vibration = []
+    X_operation = []
+    y = []
+    metadata = []
+
     for start in range(0, len(times) - window_size + 1, stride):
-        if max_samples is not None and len(hi) >= max_samples:
+        if max_samples is not None and len(y) >= max_samples:
             break
         end = start + window_size
         current_time = float(times[end - 1])
-        X_vib.append(vib[start:end])
-        X_feat.append(feat_aug[start:end])
-        rul.append(max(0.0, case_max - current_time))
-        hi.append(float(hi_per_step[end - 1]))
-        rows.append({
-            "case_name": case_name,
-            "source": source,
-            "start_timestep": start,
-            "end_timestep": end - 1,
-            "time_sec": current_time,
-            "case_max": case_max,
-        })
+        X_vibration.append(vibration_steps[start:end])
+        X_operation.append(operation_steps[start:end])
+        y.append(compute_rul(operation_df, current_time))
+        metadata.append({"case_name": case_name, "start_time": float(times[start]), "time_sec": current_time})
 
-    if not hi:
-        raise ValueError(f"window_size {window_size} > timesteps in case {case_name}")
+    if not y:
+        raise ValueError(f"Window size {window_size} is larger than available TDMS files in {vibration_dir}")
+
     return (
-        np.asarray(X_vib, dtype=np.float32),
-        np.asarray(X_feat, dtype=np.float32),
-        np.asarray(hi, dtype=np.float32),
-        np.asarray(rul, dtype=np.float32),
-        pd.DataFrame(rows),
+        np.asarray(X_vibration, dtype=np.float32),
+        np.asarray(X_operation, dtype=np.float32),
+        np.asarray(y, dtype=np.float32),
+        pd.DataFrame(metadata),
     )
 
 
-# ============================================================================
-# Top-level dataset loaders
-# ============================================================================
-
-
-def load_dataset(
-    original_dir: Path = TRAIN_DIR,
-    data2_dir: Path = DATA2_DIR,
-    include_original: bool = True,
-    include_data2: bool = True,
-    window_size: int = 32,
-    stride: int = 1,
+def build_inference_sequence(
+    vibration_dir: Path,
+    case_name: str,
+    window_size: int,
     max_samples: Optional[int] = None,
-    use_cache: bool = True,
-    degradation_baseline: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray]:
-    """Load all training cases.
+    use_vibration_proxy: Optional[bool] = None,
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Build one validation/test sequence from the latest available TDMS window."""
+    if use_vibration_proxy is None:
+        use_vibration_proxy = USE_VIBRATION_PROXY_AT_INFERENCE
 
-    Returns (X_vib, X_feat, hi, rul, metadata, degradation_baseline).
-      - hi : HI labels in [0, 1] - the training target
-      - rul: true RUL in seconds - kept alongside hi for evaluation use only
-    """
-    case_records: list[dict] = []
+    tdms_files = sorted(Path(vibration_dir).glob("*.tdms"))
+    if max_samples is not None:
+        tdms_files = tdms_files[:max_samples]
+    if len(tdms_files) < window_size:
+        raise ValueError(f"Window size {window_size} is larger than available TDMS files in {vibration_dir}")
 
-    if include_original:
-        for case_name, op_csv, vib_dir in discover_cases(original_dir):
-            print(f"  [load] {case_name} ...", end=" ", flush=True)
-            vib, feat, times, case_max, _ = load_original_case_timesteps(
-                case_name, op_csv, vib_dir, use_cache=use_cache,
-            )
-            print(f"{len(times)} steps  ({case_max/3600:.1f}h)")
-            case_records.append(dict(
-                vib=vib, feat=feat, times=times, case_max=case_max,
-                case_name=case_name, source="original",
-            ))
+    selected_files = tdms_files[-window_size:]
+    vibration_steps = []
+    for tdms_path in selected_files:
+        vibration_steps.append(vibration_stft_timestep(tdms_path))
 
-    if include_data2:
-        for case_dir in sorted(Path(data2_dir).glob("Train_No_*")):
-            if not (case_dir / "vibration.parquet").exists():
-                continue
-            print(f"  [load] {case_dir.name} ...", end=" ", flush=True)
-            vib, feat, times, case_max, _ = load_data2_case_timesteps(case_dir, use_cache=use_cache)
-            print(f"{len(times)} steps  ({case_max/3600:.1f}h)")
-            case_records.append(dict(
-                vib=vib, feat=feat, times=times, case_max=case_max,
-                case_name=case_dir.name, source="data2",
-            ))
-
-    if not case_records:
-        raise ValueError("No cases found in original_dir or data2_dir.")
-
-    if degradation_baseline is None:
-        degradation_baseline = compute_global_baseline(
-            [r["feat"] for r in case_records],
-            n_baseline=DEGRADATION_BASELINE_TIMESTEPS,
+    vib_window = np.asarray(vibration_steps, dtype=np.float32)
+    if use_vibration_proxy:
+        op_window = vibration_proxy_operation_sequence(
+            vib_window,
+            interval_sec=TDMS_ACQUISITION_INTERVAL_SEC,
         )
-    degradation_baseline = np.asarray(degradation_baseline, dtype=np.float32)
+    else:
+        op_window = np.zeros((window_size, len(OPERATION_FEATURES)), dtype=np.float32)
 
-    vibs, feats, his, ruls, metas = [], [], [], [], []
-    for r in case_records:
-        aug_feat = (
-            augment_with_degradation(r["feat"], degradation_baseline)
-            if HI_FEATURES_ENABLED else r["feat"].astype(np.float32)
-        )
-        Xv, Xf, hi, rul, m = _build_windows(
-            r["vib"], aug_feat, r["feat"], r["times"], r["case_max"],
-            r["case_name"], r["source"], window_size, stride, max_samples,
-        )
+    X_vibration = np.asarray([vib_window], dtype=np.float32)
+    X_operation = np.asarray([op_window], dtype=np.float32)
+    metadata = pd.DataFrame(
+        [
+            {
+                "case_name": case_name,
+                "start_file": selected_files[0].stem,
+                "end_file": selected_files[-1].stem,
+                "num_files": len(tdms_files),
+                "inference_operation": "vibration_proxy" if use_vibration_proxy else "zeros",
+            }
+        ]
+    )
+    return X_vibration, X_operation, metadata
+
+
+def apply_data_augmentation(X_vib_batch: np.ndarray, X_op_batch: np.ndarray, y_batch: np.ndarray, 
+                          aug_prob: float = 0.3) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """통합 데이터 증강 적용 (훈련 시에만 사용)"""
+    from features import augment_stft_features, augment_sequence_level
+    
+    vib_augmented = []
+    op_augmented = []
+    y_augmented = []
+    
+    for vib_seq, op_seq, y in zip(X_vib_batch, X_op_batch, y_batch):
+        # 원본 추가
+        vib_augmented.append(vib_seq)
+        op_augmented.append(op_seq)
+        y_augmented.append(y)
         
-        # Per-case local normalization (Degradation Delta)
-        n_base = min(10, Xv.shape[0])
-        if n_base > 0:
-            local_mean_v = Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).mean(axis=0)
-            local_std_v = np.maximum(Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).std(axis=0), 1e-8)
-            Xv = (Xv - local_mean_v) / local_std_v
-            
-            local_mean_f = Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).mean(axis=0)
-            local_std_f = np.maximum(Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).std(axis=0), 1e-8)
-            Xf = (Xf - local_mean_f) / local_std_f
-            
-        vibs.append(Xv.astype(np.float32))
-        feats.append(Xf.astype(np.float32))
-        his.append(hi); ruls.append(rul); metas.append(m)
-
+        # STFT 특징 증강 (각 채널별로)
+        vib_stft_aug = vib_seq.copy()
+        for ch in range(vib_seq.shape[1]):  # 채널별
+            for t in range(vib_seq.shape[0]):  # 타임스텝별
+                stft_features = vib_seq[t, ch]  # (freq_bins,) 
+                vib_stft_aug[t, ch] = augment_stft_features(
+                    stft_features.reshape(-1, 1), aug_prob
+                ).flatten()
+        
+        vib_augmented.append(vib_stft_aug)
+        op_augmented.append(op_seq)  # operation은 그대로
+        y_augmented.append(y)
+        
+        # 시퀀스 레벨 증강
+        seq_augmented = augment_sequence_level(vib_seq, op_seq, y, aug_prob)
+        for vib_aug, op_aug, y_aug in seq_augmented[1:]:  # 원본 제외
+            vib_augmented.append(vib_aug)
+            op_augmented.append(op_aug)
+            y_augmented.append(y_aug)
+    
     return (
-        np.concatenate(vibs, axis=0),
-        np.concatenate(feats, axis=0),
-        np.concatenate(his, axis=0),
-        np.concatenate(ruls, axis=0),
-        pd.concat(metas, ignore_index=True),
-        degradation_baseline,
+        np.array(vib_augmented, dtype=np.float32),
+        np.array(op_augmented, dtype=np.float32), 
+        np.array(y_augmented, dtype=np.float32)
     )
 
 
 def load_inference_dataset(
-    test_dir: Path,
-    window_size: int,
-    stride: int = 1,
-    use_cache: bool = True,
-    degradation_baseline: Optional[np.ndarray] = None,
+    root_dir: Path,
+    window_size: int = 32,
+    max_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Load TDMS-only Test cases. Returns ALL sliding windows per case
-    (stride=1 by default) so stage-2 can fit the HI trajectory.
+    """Load validation/test TDMS-only cases for RUL submission inference."""
+    vib_batches = []
+    op_batches = []
+    metadata_frames = []
 
-    Returns (X_vib, X_feat, metadata).  No labels available at inference.
-    Each metadata row identifies the window: case_name, end_timestep, time_sec.
-    """
-    if degradation_baseline is None:
-        raise ValueError(
-            "degradation_baseline is required for inference. "
-            "Load it from the fold checkpoint and pass it through."
+    for case_name, vibration_dir in discover_vibration_cases(root_dir):
+        X_vib, X_op, metadata = build_inference_sequence(
+            vibration_dir=vibration_dir,
+            case_name=case_name,
+            window_size=window_size,
+            max_samples=max_samples,
         )
-    degradation_baseline = np.asarray(degradation_baseline, dtype=np.float32)
+        vib_batches.append(X_vib)
+        op_batches.append(X_op)
+        metadata_frames.append(metadata)
 
-    cases = discover_tdms_inference_cases(test_dir)
-    if not cases:
-        raise ValueError(f"No TDMS inference cases under {test_dir}")
-
-    vibs, feats, metas = [], [], []
-    for case_name, vib_dir in cases:
-        vib, feat, times, _ = load_original_inference_case(case_name, vib_dir, use_cache=use_cache)
-        aug_feat = (
-            augment_with_degradation(feat, degradation_baseline)
-            if HI_FEATURES_ENABLED else feat.astype(np.float32)
-        )
-        n = len(vib)
-        if n < window_size:
-            raise ValueError(f"case {case_name}: only {n} TDMS chunks, need >= window_size={window_size}")
-        case_vibs = []
-        case_feats = []
-        case_metas = []
-        for start in range(0, n - window_size + 1, stride):
-            end = start + window_size
-            case_vibs.append(vib[start:end])
-            case_feats.append(aug_feat[start:end])
-            case_metas.append({
-                "case_name": case_name,
-                "source": "original_inference",
-                "start_timestep": start,
-                "end_timestep": end - 1,
-                "time_sec": float(times[end - 1]),
-                "num_timesteps_total": n,
-                "case_max": float(times[-1]),
-            })
-            
-        Xv = np.asarray(case_vibs, dtype=np.float32)
-        Xf = np.asarray(case_feats, dtype=np.float32)
-        
-        # Per-case local normalization (Degradation Delta)
-        n_base = min(10, Xv.shape[0])
-        if n_base > 0:
-            local_mean_v = Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).mean(axis=0)
-            local_std_v = np.maximum(Xv[:n_base].reshape(-1, Xv.shape[2], Xv.shape[3]).std(axis=0), 1e-8)
-            Xv = (Xv - local_mean_v) / local_std_v
-            
-            local_mean_f = Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).mean(axis=0)
-            local_std_f = np.maximum(Xf[:n_base].reshape(-1, Xf.shape[2], Xf.shape[3]).std(axis=0), 1e-8)
-            Xf = (Xf - local_mean_f) / local_std_f
-
-        vibs.append(Xv)
-        feats.append(Xf)
-        metas.extend(case_metas)
+    if not vib_batches:
+        raise ValueError(f"No TDMS validation/test cases found in {root_dir}")
 
     return (
-        np.concatenate(vibs, axis=0).astype(np.float32),
-        np.concatenate(feats, axis=0).astype(np.float32),
-        pd.DataFrame(metas),
+        np.concatenate(vib_batches, axis=0),
+        np.concatenate(op_batches, axis=0),
+        pd.concat(metadata_frames, ignore_index=True),
     )
+
+
+def load_dataset(
+    root_dir: Path = TRAIN_DIR,
+    window_size: int = 32,
+    stride: int = 4,
+    max_samples: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    전체 case를 로딩한다.
+    X_vibration: (batch, seq_len, 4, freq_bins)
+    X_operation: (batch, seq_len, features)
+    y: (batch,)
+    """
+    vib_batches = []
+    op_batches = []
+    targets = []
+    metadata_frames = []
+
+    for case_name, operation_csv, vibration_dir in discover_cases(root_dir):
+        loaded = sum(len(batch) for batch in targets)
+        remaining = None if max_samples is None else max_samples - loaded
+        if remaining is not None and remaining <= 0:
+            break
+
+        X_vib, X_op, y, metadata = build_case_sequences(
+            operation_csv=operation_csv,
+            vibration_dir=vibration_dir,
+            case_name=case_name,
+            window_size=window_size,
+            stride=stride,
+            max_samples=remaining,
+        )
+        vib_batches.append(X_vib)
+        op_batches.append(X_op)
+        targets.append(y)
+        metadata_frames.append(metadata)
+
+    if not vib_batches:
+        raise ValueError(f"No cases with operation CSV + TDMS files found in {root_dir}")
+
+    return (
+        np.concatenate(vib_batches, axis=0),
+        np.concatenate(op_batches, axis=0),
+        np.concatenate(targets, axis=0),
+        pd.concat(metadata_frames, ignore_index=True),
+    )
+
+
+def operation_feature_names() -> tuple[str, ...]:
+    return OPERATION_FEATURES
